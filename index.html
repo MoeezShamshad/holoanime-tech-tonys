@@ -2,115 +2,239 @@
 <html>
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>Museum Guide</title>
-
 <style>
-body{
-background:#000;
-display:flex;
-justify-content:center;
-align-items:center;
-height:100vh;
-margin:0;
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #fff;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100vh;
+  overflow: hidden;
 }
+#wrap {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+}
+video {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;       /* contain = no cropping, full character visible */
+  object-position: center center;
+  opacity: 0;
+  transition: opacity 0.1s linear;
+}
+#overlay {
+  position: absolute;
+  inset: 0;
+  background: #fff;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  z-index: 50;
+  cursor: pointer;
+  color: #111;
+  font-family: sans-serif;
+  gap: 20px;
+}
+#overlay .icon { font-size: 64px; }
+#overlay .title { font-size: 22px; font-weight: 600; }
+#overlay .sub   { font-size: 15px; opacity: 0.6; }
+#overlay.hidden { display: none; }
 
-video{
-width:420px;
-height:640px;
-object-fit:cover;
+/* Loading spinner shown after tap while videos load */
+#loader {
+  position: absolute;
+  inset: 0;
+  background: #fff;
+  display: none;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  z-index: 49;
+  font-family: sans-serif;
+  color: #555;
+  gap: 16px;
 }
+#loader.show { display: flex; }
+.spinner {
+  width: 44px; height: 44px;
+  border: 4px solid #ddd;
+  border-top-color: #333;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
-
 <body>
+<div id="wrap">
+  <video id="vid-idle"   loop muted playsinline></video>
+  <video id="vid-listen" loop muted playsinline></video>
+  <video id="vid-talk"   loop muted playsinline style="z-index:2"></video>
 
-<video id="video" muted autoplay playsinline></video>
+  <div id="overlay">
+    <div class="icon">🎙️</div>
+    <div class="title">Museum Guide</div>
+    <div class="sub">Tap anywhere to start</div>
+  </div>
+
+  <div id="loader">
+    <div class="spinner"></div>
+    <div style="font-size:14px">Loading...</div>
+  </div>
+</div>
 
 <script>
+// ── SERVER URL — auto-detects, works on localhost AND ngrok/mobile ──
+// Uses the same host/port the page was loaded from — no hardcoding needed
+const SERVER = window.location.origin;
 
-const SERVER="http://localhost:5000"
+const vidIdle   = document.getElementById("vid-idle");
+const vidListen = document.getElementById("vid-listen");
+const vidTalk   = document.getElementById("vid-talk");
+const overlay   = document.getElementById("overlay");
+const loader    = document.getElementById("loader");
+const audio     = new Audio();
 
-const video=document.getElementById("video")
+let currentState = "idle";
 
-let idleURL
-let talkURL
-
-let talking=false
-
-const audio=new Audio()
-
-
-async function activate(){
-
-const idleBlob=await fetch(SERVER+"/idle.mp4").then(r=>r.blob())
-const talkBlob=await fetch(SERVER+"/talking.mp4").then(r=>r.blob())
-
-idleURL=URL.createObjectURL(idleBlob)
-talkURL=URL.createObjectURL(talkBlob)
-
-video.src=idleURL
-video.loop=true
-video.play()
-
-connectSSE()
+// ── Show only one video ───────────────────────────────────────
+function showOnly(vid) {
+  vidIdle.style.opacity   = vid === vidIdle   ? "1" : "0";
+  vidListen.style.opacity = vid === vidListen ? "1" : "0";
+  vidTalk.style.opacity   = vid === vidTalk   ? "1" : "0";
 }
 
-
-audio.onplay=()=>{
-
-talking=true
-
-video.src=talkURL
-video.loop=true
-video.currentTime=0
-video.play()
-
+// ── IDLE ──────────────────────────────────────────────────────
+function goIdle() {
+  currentState = "idle";
+  vidTalk.pause();
+  vidListen.pause();
+  if (vidIdle.paused) vidIdle.play().catch(() => {});
+  showOnly(vidIdle);
 }
 
-audio.onended=()=>{
-
-talking=false
-
-video.src=idleURL
-video.loop=true
-video.currentTime=0
-video.play()
-
+// ── LISTENING ─────────────────────────────────────────────────
+function goListening() {
+  if (currentState === "listening") return;
+  currentState = "listening";
+  vidTalk.pause();
+  vidListen.currentTime = 0;
+  vidListen.play().catch(() => {});
+  showOnly(vidListen);
 }
 
+// ── TALKING ───────────────────────────────────────────────────
+function goTalking(emotionNum, audioUrl) {
+  currentState = "talking";
 
-function connectSSE(){
+  const talkUrl = SERVER + "/video/talk/" + emotionNum + "?cb=" + Date.now();
+  vidTalk.src = talkUrl;
+  vidTalk.load();
 
-const es=new EventSource(SERVER+"/events")
+  // Timeout fallback — if canplay never fires (slow network), start after 1.5s
+  let started = false;
+  const fallback = setTimeout(() => {
+    if (!started) {
+      started = true;
+      vidTalk.play().catch(() => {});
+      showOnly(vidTalk);
+      playAudio(audioUrl);
+    }
+  }, 1500);
 
-es.onmessage=(evt)=>{
-
-let msg
-
-try{
-msg=JSON.parse(evt.data)
-}catch{
-return
+  vidTalk.oncanplay = () => {
+    if (started) return;
+    started = true;
+    clearTimeout(fallback);
+    vidTalk.currentTime = 0;
+    vidTalk.play().catch(() => {});
+    showOnly(vidTalk);
+    vidTalk.oncanplay = null;
+    setTimeout(() => playAudio(audioUrl), 150);
+  };
 }
 
-if(msg.type==="speak"){
-
-const payload=JSON.parse(msg.data)
-
-audio.src=payload.audio_url+"&cb="+Date.now()
-
-audio.play()
-
+function playAudio(url) {
+  audio.src = url + "&cb2=" + Date.now();
+  // On mobile, play() must be called directly after a user gesture
+  // The tap on overlay counts as the gesture, so this works
+  audio.play().catch(e => {
+    console.warn("audio blocked:", e);
+    // If blocked, try once more after short delay
+    setTimeout(() => audio.play().catch(() => {}), 300);
+  });
 }
 
+// ── Audio ends → back to idle ─────────────────────────────────
+audio.addEventListener("ended", goIdle);
+audio.addEventListener("error", () => { console.warn("audio error"); goIdle(); });
+
+// ── SSE ───────────────────────────────────────────────────────
+function connectSSE() {
+  const es = new EventSource(SERVER + "/events");
+
+  es.onmessage = (evt) => {
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch { return; }
+
+    if (msg.type === "state") {
+      if (msg.data === "idle" && currentState !== "talking")     goIdle();
+      if (msg.data === "listening")                               goListening();
+      if (msg.data === "thinking" && currentState !== "talking") goListening();
+    }
+
+    if (msg.type === "speak") {
+      const p = JSON.parse(msg.data);
+      // audio_url from server still has localhost — replace with current host
+      const fixedAudioUrl = p.audio_url.replace(/http:\/\/[^/]+/, SERVER);
+      goTalking(p.emotion, fixedAudioUrl);
+    }
+  };
+
+  es.onerror = () => {
+    es.close();
+    setTimeout(connectSSE, 3000);
+  };
 }
 
-}
+// ── Tap to start ──────────────────────────────────────────────
+overlay.addEventListener("click", () => {
+  overlay.classList.add("hidden");
+  loader.classList.add("show");
 
+  // Unlock audio on mobile — MUST happen inside tap handler
+  audio.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAwF0AAIC7AAACABAAZGFOYQAAAAo=";
+  audio.play().then(() => { audio.src = ""; }).catch(() => {});
 
-document.body.addEventListener("click",activate,{once:true})
+  // Load idle video
+  vidIdle.src = SERVER + "/video/idle";
+  vidIdle.load();
 
+  vidIdle.oncanplay = () => {
+    vidIdle.oncanplay = null;
+    loader.classList.remove("show");
+    vidIdle.play().catch(() => {});
+    showOnly(vidIdle);
+    currentState = "idle";
+
+    // Silently preload listening video
+    vidListen.src = SERVER + "/video/listening";
+    vidListen.load();
+    vidListen.play().catch(() => {});
+    vidListen.pause();
+    vidListen.currentTime = 0;
+  };
+
+  connectSSE();
+});
 </script>
-
 </body>
 </html>

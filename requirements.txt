@@ -1,0 +1,15 @@
+flask
+flask_cors
+uvicorn[standard]
+groq
+mutagen
+edge-tts
+opencv-python
+numpy
+sounddevice
+faster-whisper
+torch
+soundfile
+requests
+portaudio19-dev
+pygame
