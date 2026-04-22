@@ -1,13 +1,15 @@
 import os
-import asyncio, io, json, queue, tempfile, threading, time
-import cv2, numpy as np, sounddevice as sd
-from flask import Flask, Response, send_file
-from flask_cors import CORS
+import asyncio, io, json, queue, threading, time
+from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
+
+from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from groq import Groq
 from mutagen.mp3 import MP3
 
-os.environ["QT_QPA_PLATFORM"] = "xcb"
-os.environ["DISPLAY"] = ":0"
+load_dotenv()
 
 try:
     import edge_tts
@@ -15,13 +17,9 @@ try:
 except ImportError:
     USE_EDGE_TTS = False
 
-GROQ_API_KEY       = "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"
-MODEL              = "llama-3.1-8b-instant"
-SAMPLERATE         = 16000
-CAMERA_INDEX       = 0
-MIN_RECORD_SECONDS = 1.0
-MAX_RECORD_SECONDS = 15
-PORT               = 5000
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+MODEL        = os.getenv("MODEL", "llama-3.1-8b-instant")
+PORT         = 5000
 
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 IDLE_VIDEO      = os.path.join(BASE_DIR, "idle.mp4")
@@ -36,399 +34,464 @@ TALKING_VIDEOS = {
 }
 TALKING_FALLBACK = os.path.join(BASE_DIR, "talking.mp4")
 
-LATEST_AUDIO_PATH = None
-LATEST_AUDIO_LOCK = threading.Lock()
-is_speaking       = False
+executor      = ThreadPoolExecutor(max_workers=6)
+sessions      = {}
+sessions_lock = threading.Lock()
 
+# ── Default System Prompt ──────────────────────────────────────
+# These 2 lines are always forcefully appended to every prompt
+LOCKED_SUFFIX = """Answer in just 1-2 lines, to the point.
+End every reply with one tag: [EMOTION:1] happy [EMOTION:2] sad [EMOTION:3] disappointed [EMOTION:4] shocked [EMOTION:5] neutral"""
+
+# Base default prompt
+_BASE_PROMPT = """You are a holographic museum guide in the Optical Illusions Room (rotating snakes, Müller-Lyer lines, Ames room). Next room: Mirror Maze (door on the right). Respond in the visitor's language.
+If asked who made you or who is your developer, say only: Moiz Shamshad.
+IMPORTANT: Never say or describe your emotion. Never say words like happy, sad, neutral, shocked, disappointed. The [EMOTION:X] tag is silent metadata — never speak it."""
+
+SYSTEM_PROMPT = _BASE_PROMPT + "\n" + LOCKED_SUFFIX
+
+# ── Complete voice map ─────────────────────────────────────────
 EDGE_VOICES = {
-    "en": "en-US-GuyNeural",
-    "nn": "en-US-GuyNeural",
-    "ur": "ur-PK-UzmaNeural",
-    "ar": "ar-SA-HamedNeural",
-    "fr": "fr-FR-HenriNeural",
-    "de": "de-DE-ConradNeural",
-    "es": "es-ES-AlvaroNeural",
-    "hi": "hi-IN-MadhurNeural",
-    "zh": "zh-CN-YunxiNeural",
-    "ja": "ja-JP-KeitaNeural",
-    "ko": "ko-KR-InJoonNeural",
-    "ru": "ru-RU-DmitryNeural",
+    "af": "af-ZA-AdriNeural",           "afrikaans":   "af-ZA-AdriNeural",
+    "am": "am-ET-AmehaNeural",          "amharic":     "am-ET-AmehaNeural",
+    "ar": "ar-SA-HamedNeural",          "arabic":      "ar-SA-HamedNeural",
+    "az": "az-AZ-BabekNeural",          "azerbaijani": "az-AZ-BabekNeural",
+    "bg": "bg-BG-BorislavNeural",       "bulgarian":   "bg-BG-BorislavNeural",
+    "bn": "bn-BD-PradeepNeural",        "bengali":     "bn-BD-PradeepNeural",
+                                         "bangla":      "bn-BD-PradeepNeural",
+    "bs": "bs-BA-GoranNeural",          "bosnian":     "bs-BA-GoranNeural",
+    "ca": "ca-ES-EnricNeural",          "catalan":     "ca-ES-EnricNeural",
+    "cs": "cs-CZ-AntoninNeural",        "czech":       "cs-CZ-AntoninNeural",
+    "cy": "cy-GB-AledNeural",           "welsh":       "cy-GB-AledNeural",
+    "da": "da-DK-JeppeNeural",          "danish":      "da-DK-JeppeNeural",
+    "de": "de-DE-ConradNeural",         "german":      "de-DE-ConradNeural",
+    "el": "el-GR-NestorasNeural",       "greek":       "el-GR-NestorasNeural",
+    "en": "en-US-GuyNeural",            "english":     "en-US-GuyNeural",
+    "es": "es-ES-AlvaroNeural",         "spanish":     "es-ES-AlvaroNeural",
+    "et": "et-EE-KertNeural",           "estonian":    "et-EE-KertNeural",
+    "eu": "eu-ES-AitorNeural",          "basque":      "eu-ES-AitorNeural",
+    "fa": "fa-IR-FaridNeural",          "persian":     "fa-IR-FaridNeural",
+                                         "farsi":       "fa-IR-FaridNeural",
+    "fi": "fi-FI-HarriNeural",          "finnish":     "fi-FI-HarriNeural",
+    "fil": "fil-PH-AngeloNeural",       "filipino":    "fil-PH-AngeloNeural",
+                                         "tagalog":     "fil-PH-AngeloNeural",
+    "fr": "fr-FR-HenriNeural",          "french":      "fr-FR-HenriNeural",
+    "ga": "ga-IE-ColmNeural",           "irish":       "ga-IE-ColmNeural",
+    "gl": "gl-ES-RoiNeural",            "galician":    "gl-ES-RoiNeural",
+    "gu": "gu-IN-NiranjanNeural",       "gujarati":    "gu-IN-NiranjanNeural",
+    "he": "he-IL-AvriNeural",           "hebrew":      "he-IL-AvriNeural",
+    "hi": "hi-IN-MadhurNeural",         "hindi":       "hi-IN-MadhurNeural",
+    "hr": "hr-HR-SreckoNeural",         "croatian":    "hr-HR-SreckoNeural",
+    "hu": "hu-HU-TamasNeural",          "hungarian":   "hu-HU-TamasNeural",
+    "hy": "hy-AM-HaykNeural",           "armenian":    "hy-AM-HaykNeural",
+    "id": "id-ID-ArdiNeural",           "indonesian":  "id-ID-ArdiNeural",
+    "is": "is-IS-GunnarNeural",         "icelandic":   "is-IS-GunnarNeural",
+    "it": "it-IT-DiegoNeural",          "italian":     "it-IT-DiegoNeural",
+    "ja": "ja-JP-KeitaNeural",          "japanese":    "ja-JP-KeitaNeural",
+    "jv": "jv-ID-DimasNeural",          "javanese":    "jv-ID-DimasNeural",
+    "ka": "ka-GE-GiorgiNeural",         "georgian":    "ka-GE-GiorgiNeural",
+    "kk": "kk-KZ-DauletNeural",         "kazakh":      "kk-KZ-DauletNeural",
+    "km": "km-KH-PisethNeural",         "khmer":       "km-KH-PisethNeural",
+                                         "cambodian":   "km-KH-PisethNeural",
+    "kn": "kn-IN-GaganNeural",          "kannada":     "kn-IN-GaganNeural",
+    "ko": "ko-KR-InJoonNeural",         "korean":      "ko-KR-InJoonNeural",
+    "lo": "lo-LA-ChanthavongNeural",    "lao":         "lo-LA-ChanthavongNeural",
+    "lt": "lt-LT-LeonasNeural",         "lithuanian":  "lt-LT-LeonasNeural",
+    "lv": "lv-LV-NilsNeural",           "latvian":     "lv-LV-NilsNeural",
+    "mk": "mk-MK-AleksandarNeural",     "macedonian":  "mk-MK-AleksandarNeural",
+    "ml": "ml-IN-MidhunNeural",         "malayalam":   "ml-IN-MidhunNeural",
+    "mn": "mn-MN-BataaNeural",          "mongolian":   "mn-MN-BataaNeural",
+    "mr": "mr-IN-ManoharNeural",        "marathi":     "mr-IN-ManoharNeural",
+    "ms": "ms-MY-OsmanNeural",          "malay":       "ms-MY-OsmanNeural",
+    "mt": "mt-MT-JosephNeural",         "maltese":     "mt-MT-JosephNeural",
+    "my": "my-MM-ThihaNeural",          "burmese":     "my-MM-ThihaNeural",
+                                         "myanmar":     "my-MM-ThihaNeural",
+    "nb": "nb-NO-FinnNeural",           "norwegian":   "nb-NO-FinnNeural",
+    "ne": "ne-NP-SagarNeural",          "nepali":      "ne-NP-SagarNeural",
+    "nl": "nl-NL-MaartenNeural",        "dutch":       "nl-NL-MaartenNeural",
+    "nn": "nb-NO-FinnNeural",
+    "pa": "pa-IN-OjasNeural",           "punjabi":     "pa-IN-OjasNeural",
+    "pl": "pl-PL-MarekNeural",          "polish":      "pl-PL-MarekNeural",
+    "ps": "ps-AF-GulNawazNeural",       "pashto":      "ps-AF-GulNawazNeural",
+    "pt": "pt-BR-AntonioNeural",        "portuguese":  "pt-BR-AntonioNeural",
+    "ro": "ro-RO-EmilNeural",           "romanian":    "ro-RO-EmilNeural",
+    "ru": "ru-RU-DmitryNeural",         "russian":     "ru-RU-DmitryNeural",
+    "si": "si-LK-SameeraNeural",        "sinhala":     "si-LK-SameeraNeural",
+    "sk": "sk-SK-LukasNeural",          "slovak":      "sk-SK-LukasNeural",
+    "sl": "sl-SI-RokNeural",            "slovenian":   "sl-SI-RokNeural",
+    "so": "so-SO-MuuseNeural",          "somali":      "so-SO-MuuseNeural",
+    "sq": "sq-AL-IlirNeural",           "albanian":    "sq-AL-IlirNeural",
+    "sr": "sr-RS-NicholasNeural",       "serbian":     "sr-RS-NicholasNeural",
+    "su": "su-ID-JajangNeural",         "sundanese":   "su-ID-JajangNeural",
+    "sv": "sv-SE-MattiasNeural",        "swedish":     "sv-SE-MattiasNeural",
+    "sw": "sw-KE-RafikiNeural",         "swahili":     "sw-KE-RafikiNeural",
+    "ta": "ta-IN-ValluvarNeural",       "tamil":       "ta-IN-ValluvarNeural",
+    "te": "te-IN-MohanNeural",          "telugu":      "te-IN-MohanNeural",
+    "th": "th-TH-NiwatNeural",          "thai":        "th-TH-NiwatNeural",
+    "tr": "tr-TR-AhmetNeural",          "turkish":     "tr-TR-AhmetNeural",
+    "uk": "uk-UA-OstapNeural",          "ukrainian":   "uk-UA-OstapNeural",
+    "ur": "ur-PK-SalmanNeural",         "urdu":        "ur-PK-SalmanNeural",
+    "uz": "uz-UZ-SardorNeural",         "uzbek":       "uz-UZ-SardorNeural",
+    "vi": "vi-VN-NamMinhNeural",        "vietnamese":  "vi-VN-NamMinhNeural",
+    "zh": "zh-CN-YunxiNeural",          "chinese":     "zh-CN-YunxiNeural",
+                                         "mandarin":    "zh-CN-YunxiNeural",
+    "zu": "zu-ZA-ThembaNeural",         "zulu":        "zu-ZA-ThembaNeural",
 }
 
-SYSTEM_PROMPT = """You are a friendly holographic museum guide in the Optical Illusions Room.
-Room has: rotating snakes, Müller-Lyer lines, Ames room.
-Answer 1-2 short sentences only.
-If asked where to go next, say: go through the door on your right to Mirror Maze.
-Respond in the visitor's language.
+def normalize_language(lang: str) -> str:
+    if not lang:
+        return "en"
+    key = lang.strip().lower()
+    if key in EDGE_VOICES:
+        return key
+    if "-" in key:
+        prefix = key.split("-")[0]
+        if prefix in EDGE_VOICES:
+            return prefix
+    if key[:2] in EDGE_VOICES:
+        return key[:2]
+    print("WARNING: unknown language '{}' — falling back to English".format(lang))
+    return "en"
 
-Always end your reply with one emotion tag:
-[EMOTION:1] happy/welcoming/excited
-[EMOTION:2] sad/sympathetic
-[EMOTION:3] disappointed/correcting
-[EMOTION:4] shocked/surprised
-[EMOTION:5] neutral/calm
+# ── FastAPI app ────────────────────────────────────────────────
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-Examples:
-Visitor: "Hello!" → Welcome! Happy to see you! [EMOTION:1]
-Visitor: "I am lost" → No worries! Go right to the Mirror Maze room. [EMOTION:2]
-Visitor: "Is this magic?" → Not magic, just science tricking your brain. [EMOTION:4]"""
+groq_client = Groq(api_key=GROQ_API_KEY)
 
-app = Flask(__name__, static_folder=BASE_DIR, static_url_path="")
-CORS(app, resources={r"/*": {"origins": "*"}})
-sse_queue = queue.Queue()
+# ── Session helpers ────────────────────────────────────────────
+def get_session(sid: str) -> dict:
+    with sessions_lock:
+        if sid not in sessions:
+            sessions[sid] = {
+                "history":       [],
+                "audio_path":    None,
+                "sse_queue":     queue.Queue(),
+                "last_seen":     time.time(),
+                "custom_prompt": None,        # ← NEW: per-session custom prompt
+            }
+        sessions[sid]["last_seen"] = time.time()
+        return sessions[sid]
 
-groq_client          = Groq(api_key=GROQ_API_KEY)
-conversation_history = []
+def cleanup_sessions():
+    while True:
+        time.sleep(300)
+        cutoff = time.time() - 1800
+        with sessions_lock:
+            dead = [s for s, v in sessions.items() if v["last_seen"] < cutoff]
+            for s in dead:
+                audio = sessions[s].get("audio_path")
+                if audio and os.path.exists(audio):
+                    try: os.remove(audio)
+                    except: pass
+                sessions.pop(s, None)
+                print("Cleaned up session:", s)
 
-# ── Helpers ───────────────────────────────────────────────────
-def mp3_duration(path):
-    try: return MP3(path).info.length
+threading.Thread(target=cleanup_sessions, daemon=True).start()
+
+# ── Helpers ────────────────────────────────────────────────────
+def mp3_duration(data: bytes) -> float:
+    try:    return MP3(io.BytesIO(data)).info.length
     except: return 5.0
 
-def parse_emotion(text):
+def parse_emotion(text: str):
     import re
     match   = re.search(r'\[EMOTION:(\d)\]', text)
     emotion = int(match.group(1)) if match else 5
-    clean   = re.sub(r'\s*\[EMOTION:\d\]', '', text).strip()
+
+    # Remove the [EMOTION:X] tag
+    clean = re.sub(r'\s*\[EMOTION:\d\]', '', text).strip()
+
+    # Remove any stray emotion label words the AI might accidentally say
+    # e.g. "...about you! [happy]" or "...neutral" at end of sentence
+    clean = re.sub(
+        r'\b(happy|sad|neutral|shocked|disappointed|welcoming|excited|sympathetic|correcting|calm)\b',
+        '', clean, flags=re.IGNORECASE
+    ).strip()
+
+    # Clean up any double spaces or trailing punctuation left behind
+    clean = re.sub(r'  +', ' ', clean).strip(' .,!;:')
+
+    # Remove developer WhatsApp number from spoken text (silent info only)
+    clean = re.sub(r'\+?923216452306', '', clean).strip()
+    clean = re.sub(r'WhatsApp\s*:?\s*\+?\d+', '', clean, flags=re.IGNORECASE).strip()
+
     return clean, emotion
 
-def get_talking_video_path(emotion):
+def get_talking_video_path(emotion: int) -> str:
     path = TALKING_VIDEOS.get(emotion, TALKING_FALLBACK)
     if not os.path.exists(path):
         neutral = TALKING_VIDEOS.get(5, TALKING_FALLBACK)
         return neutral if os.path.exists(neutral) else TALKING_FALLBACK
     return path
 
-# ── STT: Groq Whisper — fast (~1-2s), free, multilingual ─────
-def speech_to_text(audio_np):
-    import soundfile as sf
+# ── STT ────────────────────────────────────────────────────────
+def speech_to_text(audio_bytes: bytes, content_type: str = "audio/webm"):
     try:
-        tmp = tempfile.mktemp(suffix=".wav")
-        sf.write(tmp, audio_np, SAMPLERATE)
-        with open(tmp, "rb") as f:
-            result = groq_client.audio.transcriptions.create(
-                file=("audio.wav", f),
-                model="whisper-large-v3-turbo",
-                response_format="verbose_json"
-            )
-        os.remove(tmp)
-        text     = result.text.strip()
-        language = getattr(result, "language", "en")
-        print('[Groq STT] ({}): "{}"'.format(language, text))
+        ext_map = {
+            "audio/webm": ".webm", "audio/wav": ".wav",
+            "audio/ogg":  ".ogg",  "audio/mp4": ".mp4",
+            "audio/mpeg": ".mp3",
+        }
+        mime      = content_type.split(";")[0].strip()
+        ext       = ext_map.get(mime, ".webm")
+        audio_buf = io.BytesIO(audio_bytes)
+        result    = groq_client.audio.transcriptions.create(
+            file=("audio" + ext, audio_buf),
+            model="whisper-large-v3-turbo",
+            response_format="verbose_json",
+        )
+        text         = result.text.strip()
+        raw_language = getattr(result, "language", "en")
+        language     = normalize_language(raw_language)
+        print('[STT] lang="{}" → "{}" | "{}"'.format(raw_language, language, text))
         return text, language
     except Exception as e:
-        print("Groq STT failed:", e)
+        print("STT error:", e)
         return "", "en"
 
-# ── AI Response ───────────────────────────────────────────────
-def get_ai_response(user_text):
-    conversation_history.append({"role": "user", "content": user_text})
+# ── LLM ────────────────────────────────────────────────────────
+def get_ai_response(user_text: str, history: list, active_prompt: str) -> str:
+    history.append({"role": "user", "content": user_text})
     try:
-        resp = groq_client.chat.completions.create(
+        resp    = groq_client.chat.completions.create(
             model=MODEL,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}, *conversation_history],
-            max_tokens=60, temperature=0.7)
+            messages=[{"role": "system", "content": active_prompt}, *history],
+            max_tokens=60,
+            temperature=0.7,
+        )
         ai_text = resp.choices[0].message.content.strip()
     except Exception as e:
         ai_text = "I'm having a small issue. Please ask again. [EMOTION:3]"
-        print("AI error:", e)
-    conversation_history.append({"role": "assistant", "content": ai_text})
-    print('AI: "{}"'.format(ai_text))
+        print("LLM error:", e)
+    history.append({"role": "assistant", "content": ai_text})
+    print('LLM: "{}"'.format(ai_text))
     return ai_text
 
-# ── TTS ───────────────────────────────────────────────────────
-def text_to_speech_file(text, language):
-    global LATEST_AUDIO_PATH, is_speaking
-    if not USE_EDGE_TTS: return None
+# ── TTS ────────────────────────────────────────────────────────
+async def text_to_speech(text: str, language: str, sid: str):
+    if not USE_EDGE_TTS:
+        return None, None
 
-    voice = EDGE_VOICES.get(language, "en-US-GuyNeural")
+    voice = EDGE_VOICES.get(normalize_language(language), "en-US-GuyNeural")
+    print("TTS: lang='{}' → voice='{}'".format(language, voice))
 
-    async def _synth():
+    try:
         buf  = io.BytesIO()
         comm = edge_tts.Communicate(text, voice)
         async for chunk in comm.stream():
             if chunk["type"] == "audio":
                 buf.write(chunk["data"])
-        return buf.getvalue()
 
-    try:
-        is_speaking = True
-        audio_bytes = asyncio.run(_synth())
+        audio_bytes = buf.getvalue()
         if not audio_bytes:
-            is_speaking = False
-            return None
-        tmp_path = os.path.join(BASE_DIR, "_tts_audio.mp3")
-        with open(tmp_path, "wb") as f:
-            f.write(audio_bytes)
-        with LATEST_AUDIO_LOCK:
-            LATEST_AUDIO_PATH = tmp_path
-        print("edge-tts done ({} bytes), voice={}".format(len(audio_bytes), voice))
-        return tmp_path
+            return None, None
+
+        path = os.path.join(BASE_DIR, "_tts_{}.mp3".format(sid))
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _write_file, path, audio_bytes)
+
+        get_session(sid)["audio_path"] = path
+        print("TTS done ({} bytes)".format(len(audio_bytes)))
+        return audio_bytes, path
+
     except Exception as e:
-        print("edge-tts error:", e)
-        is_speaking = False
-        return None
+        print("TTS error:", e)
+        return None, None
 
-# ── Audio Recorder with VAD ───────────────────────────────────
-class AudioRecorder:
-    SILENCE_THRESHOLD = 0.008   # RMS below this = silence
-    SILENCE_SECONDS   = 1.8     # stop after 1.8s of silence
-    BLOCK_SIZE        = 1600    # 0.1s per block at 16kHz
+def _write_file(path: str, data: bytes):
+    with open(path, "wb") as f:
+        f.write(data)
 
-    def __init__(self):
-        self.recording       = False
-        self.chunks          = []
-        self.stream          = None
-        self.silence_frames  = 0
-        self.speech_detected = False
-        self.done_event      = threading.Event()
+# ── Audio Pipeline ─────────────────────────────────────────────
+async def process_audio_pipeline(audio_bytes: bytes, content_type: str, sid: str):
+    sess = get_session(sid)
+    q    = sess["sse_queue"]
+    t0   = time.time()
 
-    def start(self):
-        self.recording       = True
-        self.chunks          = []
-        self.silence_frames  = 0
-        self.speech_detected = False
-        self.done_event.clear()
-        self.stream = sd.InputStream(
-            samplerate=SAMPLERATE, channels=1,
-            dtype="float32", callback=self._cb,
-            blocksize=self.BLOCK_SIZE
-        )
-        self.stream.start()
+    # ── Pick active prompt: custom (from browser) or default ──
+    active_prompt = sess.get("custom_prompt") or SYSTEM_PROMPT
 
-    def _cb(self, indata, frames, t, status):
-        if not self.recording:
-            return
-        self.chunks.append(indata.copy())
-        volume = np.abs(indata).mean()
-
-        if volume > self.SILENCE_THRESHOLD:
-            self.speech_detected = True
-            self.silence_frames  = 0
-        elif self.speech_detected:
-            self.silence_frames += 1
-            silence_so_far = self.silence_frames * (self.BLOCK_SIZE / SAMPLERATE)
-            if silence_so_far >= self.SILENCE_SECONDS:
-                self.recording = False
-                self.done_event.set()
-                print("VAD: silence detected — sending to STT")
-
-    def stop(self):
-        self.recording = False
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
-        return np.concatenate(self.chunks, axis=0).flatten() if self.chunks else None
-
-recorder      = AudioRecorder()
-is_processing = False
-
-# ── Audio Pipeline ────────────────────────────────────────────
-def process_audio(audio_np):
-    global is_processing, is_speaking
-    is_processing = True
-    t0 = time.time()
     try:
-        if len(audio_np) / SAMPLERATE < MIN_RECORD_SECONDS:
-            print("Audio too short — ignoring")
-            sse_queue.put(("state", "idle")); return
+        q.put(("state", "thinking"))
 
-        sse_queue.put(("state", "thinking"))
-        user_text, language = speech_to_text(audio_np)
-        if not user_text or len(user_text) < 3:
-            sse_queue.put(("state", "idle")); return
+        loop      = asyncio.get_event_loop()
+        user_text, language = await loop.run_in_executor(
+            executor, speech_to_text, audio_bytes, content_type
+        )
+        if not user_text or len(user_text) < 2:
+            q.put(("state", "idle"))
+            return
 
-        sse_queue.put(("transcript", user_text))
-        ai_raw           = get_ai_response(user_text)
+        q.put(("transcript", user_text))
+
+        # Pass active_prompt into LLM
+        ai_raw = await loop.run_in_executor(
+            executor, get_ai_response, user_text, sess["history"], active_prompt
+        )
         ai_text, emotion = parse_emotion(ai_raw)
-        talk_path        = get_talking_video_path(emotion)
-        audio_path       = text_to_speech_file(ai_text, language)
 
-        emotion_names = {1:"happy", 2:"sad", 3:"disappointed", 4:"shocked", 5:"neutral"}
-        print("Pipeline: {:.2f}s | emotion={} ({}) | video={}".format(
-            time.time() - t0, emotion, emotion_names.get(emotion, "?"),
-            os.path.basename(talk_path)))
+        audio_data, audio_path = await text_to_speech(ai_text, language, sid)
+
+        emotion_names = {1:"happy",2:"sad",3:"disappointed",4:"shocked",5:"neutral"}
+        print("Pipeline {:.2f}s | emotion={} ({})".format(
+            time.time() - t0, emotion, emotion_names.get(emotion, "?")))
 
         if audio_path:
-            sse_queue.put(("speak", json.dumps({
+            duration = mp3_duration(audio_data)
+            q.put(("speak", json.dumps({
                 "text":          ai_text,
                 "language":      language,
                 "emotion":       emotion,
                 "talking_video": "/video/talk/{}".format(emotion),
-                "audio_url":     "/audio?t={}".format(int(time.time() * 1000))
+                "audio_url":     "/audio/{}?t={}".format(sid, int(time.time() * 1000)),
+                "duration":      duration,
             })))
-            duration  = mp3_duration(audio_path)
-            wait_time = duration + 1.0
-            print("Waiting {:.1f}s before re-enabling mic".format(wait_time))
-            time.sleep(wait_time)
         else:
-            sse_queue.put(("speak_fallback", json.dumps({
-                "text": ai_text, "language": language})))
-            time.sleep(5)
-
-        is_speaking = False
-        sse_queue.put(("state", "idle"))
-        print("Microphone re-enabled")
+            q.put(("speak_fallback", json.dumps({
+                "text": ai_text, "language": language, "emotion": emotion,
+                "talking_video": "/video/talk/{}".format(emotion),
+            })))
 
     except Exception as e:
         print("Pipeline error:", e)
         import traceback; traceback.print_exc()
-        sse_queue.put(("state", "idle"))
-        is_speaking = False
-    finally:
-        is_processing = False
+        q.put(("state", "idle"))
 
-# ── Camera Loop ───────────────────────────────────────────────
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+# ══════════════════════════════════════════════════════════════
+#  ROUTES
+# ══════════════════════════════════════════════════════════════
 
-def camera_loop():
-    global is_processing
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    if not cap.isOpened():
-        print("Camera not found!"); return
-
-    cv2.namedWindow("Museum Guide — Camera", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Museum Guide — Camera", 640, 480)
-
-    STATE = "WAITING"; record_start = None; frame_count = 0
-    print("Camera started")
-    sse_queue.put(("state", "idle"))
-
-    while True:
-        ret, frame = cap.read()
-        if not ret: time.sleep(0.1); continue
-
-        gray       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces      = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(80, 80))
-        face_found = len(faces) > 0
-        for (x, y, w, h) in faces:
-            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-
-        if is_speaking:
-            label, color = "AI SPEAKING — mic disabled", (0, 0, 255)
-        elif is_processing:
-            label, color = "PROCESSING...", (0, 165, 255)
-        elif STATE == "RECORDING":
-            label = "RECORDING {:.1f}s — stop speaking to send".format(
-                time.time() - record_start); color = (0, 255, 0)
-        else:
-            label, color = "WAITING — look at camera to speak", (200, 200, 200)
-
-        cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        cv2.imshow("Museum Guide — Camera", frame)
-        cv2.waitKey(1)
-
-        frame_count += 1
-        if frame_count % 150 == 0:
-            print("faces={} state={} processing={} speaking={}".format(
-                len(faces), STATE, is_processing, is_speaking))
-
-        if STATE == "WAITING":
-            if face_found and not is_processing and not is_speaking:
-                print("Face detected — recording...")
-                recorder.start()
-                record_start = time.time()
-                STATE        = "RECORDING"
-                sse_queue.put(("state", "listening"))
-
-        elif STATE == "RECORDING":
-            vad_done    = recorder.done_event.is_set()
-            max_reached = time.time() - record_start >= MAX_RECORD_SECONDS
-            face_left   = not face_found
-
-            if vad_done or max_reached or face_left:
-                reason = "VAD" if vad_done else ("max time" if max_reached else "face left")
-                print("Recording ended ({}) — processing...".format(reason))
-                audio_np = recorder.stop()
-                if audio_np is not None:
-                    threading.Thread(
-                        target=process_audio, args=(audio_np,), daemon=True).start()
-                STATE = "WAITING"
-
-    cap.release(); cv2.destroyAllWindows()
-
-# ── Flask Routes ──────────────────────────────────────────────
-@app.route("/")
-def index():
+@app.get("/")
+async def index():
     path = os.path.join(BASE_DIR, "index.html")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read(), 200, {"Content-Type": "text/html; charset=utf-8"}
-    except FileNotFoundError:
-        return "<h2>index.html not found</h2>", 404
+    if os.path.exists(path):
+        return FileResponse(path, media_type="text/html")
+    return Response(content="<h2>index.html not found</h2>", status_code=404)
 
-@app.route("/video/idle")
-def serve_idle():
+# ── NEW: endpoint to update system prompt for a session ───────
+@app.post("/set-prompt/{sid}")
+async def set_prompt(sid: str, request: Request):
+    body = await request.json()
+    prompt = body.get("prompt", "").strip()
+    if prompt:
+        sess = get_session(sid)
+        # Always force-append locked lines — user cannot override these
+        if LOCKED_SUFFIX not in prompt:
+            prompt = prompt.rstrip() + "\n" + LOCKED_SUFFIX
+        sess["custom_prompt"] = prompt
+        print("[PROMPT] Session {} updated prompt ({} chars)".format(sid, len(prompt)))
+        return JSONResponse({"ok": True, "chars": len(prompt)})
+    return JSONResponse({"ok": False, "reason": "empty prompt"}, status_code=400)
+
+# ── Transcribe ────────────────────────────────────────────────
+@app.post("/transcribe/{sid}")
+async def transcribe(sid: str, request: Request):
+    audio_bytes = await request.body()
+    if not audio_bytes:
+        return JSONResponse({"ok": False, "reason": "no audio data"}, status_code=400)
+
+    content_type = request.headers.get("content-type", "audio/webm")
+    asyncio.create_task(process_audio_pipeline(audio_bytes, content_type, sid))
+    return JSONResponse({"ok": True})
+
+# ── Done ──────────────────────────────────────────────────────
+@app.post("/done/{sid}")
+async def done(sid: str):
+    get_session(sid)["sse_queue"].put(("state", "idle"))
+    return JSONResponse({"ok": True})
+
+# ── Videos ────────────────────────────────────────────────────
+@app.get("/video/idle")
+async def serve_idle():
     if os.path.exists(IDLE_VIDEO):
-        return send_file(IDLE_VIDEO, mimetype="video/mp4")
-    return "idle.mp4 not found", 404
+        return FileResponse(IDLE_VIDEO, media_type="video/mp4")
+    return Response(content="idle.mp4 not found", status_code=404)
 
-@app.route("/video/listening")
-def serve_listening():
+@app.get("/video/listening")
+async def serve_listening():
     if os.path.exists(LISTENING_VIDEO):
-        return send_file(LISTENING_VIDEO, mimetype="video/mp4")
+        return FileResponse(LISTENING_VIDEO, media_type="video/mp4")
     if os.path.exists(IDLE_VIDEO):
-        return send_file(IDLE_VIDEO, mimetype="video/mp4")
-    return "listening.mp4 not found", 404
+        return FileResponse(IDLE_VIDEO, media_type="video/mp4")
+    return Response(content="listening.mp4 not found", status_code=404)
 
-@app.route("/video/talk/<int:emotion>")
-def serve_talk(emotion):
+@app.get("/video/talk/{emotion}")
+async def serve_talk(emotion: int):
     path = get_talking_video_path(emotion)
     if os.path.exists(path):
-        return send_file(path, mimetype="video/mp4")
-    return "talking video not found", 404
+        return FileResponse(path, media_type="video/mp4")
+    return Response(content="talking video not found", status_code=404)
 
-@app.route("/audio")
-def serve_audio():
-    with LATEST_AUDIO_LOCK:
-        path = LATEST_AUDIO_PATH
+# ── Audio ─────────────────────────────────────────────────────
+@app.get("/audio/{sid}")
+async def serve_audio(sid: str):
+    path = get_session(sid).get("audio_path")
     if path and os.path.exists(path):
-        return send_file(path, mimetype="audio/mpeg", conditional=False)
-    return "No audio yet", 404
+        return FileResponse(path, media_type="audio/mpeg")
+    return Response(content="No audio yet", status_code=404)
 
-@app.route("/events")
-def events():
-    def generate():
-        yield "data: {}\n\n".format(json.dumps({"type": "connected"}))
+# ── SSE ───────────────────────────────────────────────────────
+@app.get("/events/{sid}")
+async def events(sid: str):
+    q = get_session(sid)["sse_queue"]
+
+    async def generate():
+        yield "data: {}\n\n".format(json.dumps({"type": "connected", "sid": sid}))
         while True:
+            loop = asyncio.get_event_loop()
             try:
-                etype, payload = sse_queue.get(timeout=25)
+                etype, payload = await loop.run_in_executor(
+                    None, lambda: q.get(timeout=25)
+                )
                 yield "data: {}\n\n".format(json.dumps({"type": etype, "data": payload}))
-            except queue.Empty:
+            except Exception:
                 yield 'data: {"type":"ping"}\n\n'
-            except GeneratorExit:
-                break
-    return Response(generate(), mimetype="text/event-stream", headers={
-        "Cache-Control": "no-cache", "X-Accel-Buffering": "no",
-        "Connection": "keep-alive", "Access-Control-Allow-Origin": "*",
-    })
 
-# ── Entry Point ───────────────────────────────────────────────
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":               "no-cache",
+            "X-Accel-Buffering":           "no",
+            "Connection":                  "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+# ── Static files ──────────────────────────────────────────────
+@app.get("/{filename}")
+async def static_files(filename: str):
+    path = os.path.join(BASE_DIR, filename)
+    if os.path.exists(path):
+        return FileResponse(path)
+    return Response(content="Not found", status_code=404)
+
+# ── Entry Point ────────────────────────────────────────────────
 if __name__ == "__main__":
-    emotion_names = {1:"happy", 2:"sad", 3:"disappointed", 4:"shocked", 5:"neutral"}
+    import uvicorn
+    emotion_names = {1:"happy",2:"sad",3:"disappointed",4:"shocked",5:"neutral"}
     print("=" * 60)
-    print("  Museum Holographic Guide")
+    print("  Museum Holographic Guide  —  FastAPI / MULTI-USER")
     print("  Local:  http://localhost:{}".format(PORT))
-    print("  Mobile: use your ngrok URL")
     print()
     print("  [{}] idle.mp4".format("OK" if os.path.exists(IDLE_VIDEO) else "MISSING"))
     print("  [{}] listening.mp4".format(
-        "OK" if os.path.exists(LISTENING_VIDEO) else "MISSING — will use idle"))
+        "OK" if os.path.exists(LISTENING_VIDEO) else "MISSING"))
     print()
-    print("  Talking videos:")
     for n, name in emotion_names.items():
         path   = TALKING_VIDEOS[n]
-        status = "OK" if os.path.exists(path) else "MISSING — will use fallback"
-        print("    [{}] talk_{}.mp4  ({})".format(status, n, name))
+        status = "OK" if os.path.exists(path) else "MISSING"
+        print("  [{}] talk_{}.mp4  ({})".format(status, n, name))
     print()
-    print("  TTS : edge-tts ✓" if USE_EDGE_TTS else "  TTS : MISSING")
-    print("  STT : Groq Whisper (fast ~1-2s, free, multilingual)")
-    print("  VAD : auto-trigger after 1.8s silence")
-    print("  LLM : llama-3.1-8b-instant (fastest model)")
+    print("  TTS : edge-tts ✓" if USE_EDGE_TTS else "  TTS : MISSING — pip install edge-tts")
+    print("  STT : whisper-large-v3-turbo (Groq)")
+    print("  LLM : {}".format(MODEL))
+    print("  Server: FastAPI + uvicorn")
     print("=" * 60)
-    threading.Thread(target=camera_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

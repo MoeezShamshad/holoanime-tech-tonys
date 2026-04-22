@@ -2,238 +2,880 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Museum Guide</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Sora:wght@300;400;600&display=swap" rel="stylesheet">
 <style>
+/* ══════════════════════════════════════════════════
+   BASE
+══════════════════════════════════════════════════ */
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
-  background: #fff;
+  background: #000;
   display: flex;
   justify-content: center;
   align-items: center;
   height: 100vh;
   overflow: hidden;
+  font-family: 'Segoe UI', sans-serif;
 }
-#wrap {
-  position: relative;
-  width: 100vw;
-  height: 100vh;
-}
-video {
+#wrap { position: relative; width: 100vw; height: 100vh; }
+
+/* ── Avatar videos ── */
+video.avatar {
   position: absolute;
   top: 0; left: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: contain;       /* contain = no cropping, full character visible */
+  width: 100%; height: 100%;
+  object-fit: contain;
   object-position: center center;
   opacity: 0;
-  transition: opacity 0.1s linear;
+  transition: opacity 0.15s linear;
+  pointer-events: none;
 }
+.vid-talk { z-index: 2; }
+
+/* ── Overlay ── */
 #overlay {
-  position: absolute;
-  inset: 0;
-  background: #fff;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  align-items: center;
-  z-index: 50;
-  cursor: pointer;
-  color: #111;
-  font-family: sans-serif;
-  gap: 20px;
+  position: absolute; inset: 0;
+  background: #000;
+  display: flex; flex-direction: column;
+  justify-content: center; align-items: center;
+  z-index: 100; cursor: pointer; gap: 18px;
 }
-#overlay .icon { font-size: 64px; }
-#overlay .title { font-size: 22px; font-weight: 600; }
-#overlay .sub   { font-size: 15px; opacity: 0.6; }
+#overlay .icon  { font-size: 72px; }
+#overlay .title { font-size: 24px; font-weight: 700; color: #eee; letter-spacing: 1px; }
+#overlay .sub   { font-size: 15px; color: #666; }
 #overlay.hidden { display: none; }
 
-/* Loading spinner shown after tap while videos load */
+/* ── Loader ── */
 #loader {
-  position: absolute;
-  inset: 0;
-  background: #fff;
-  display: none;
-  flex-direction: column;
-  justify-content: center;
-  align-items: center;
-  z-index: 49;
-  font-family: sans-serif;
-  color: #555;
-  gap: 16px;
+  position: absolute; inset: 0;
+  background: #000;
+  display: none; flex-direction: column;
+  justify-content: center; align-items: center;
+  z-index: 99; gap: 16px; color: #555;
 }
 #loader.show { display: flex; }
 .spinner {
   width: 44px; height: 44px;
-  border: 4px solid #ddd;
-  border-top-color: #333;
+  border: 4px solid #222; border-top-color: #888;
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Face camera preview ── */
+#face-cam {
+  position: absolute; bottom: 16px; right: 16px;
+  width: 120px; height: 90px;
+  border-radius: 10px; overflow: hidden;
+  z-index: 10; border: 2px solid #222; display: none;
+}
+#face-cam video  { width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
+#face-cam canvas { position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; }
+
+/* ── Status bar ── */
+#status-bar {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  padding: 10px 18px; display: none;
+  align-items: center; gap: 10px; z-index: 20;
+  background: linear-gradient(transparent, rgba(0,0,0,0.7));
+}
+#status-bar.show { display: flex; }
+#status-dot {
+  width:10px; height:10px; border-radius:50%;
+  background:#555; flex-shrink:0; transition:background 0.3s;
+}
+#status-dot.idle      { background:#555; }
+#status-dot.listening { background:#00cc66; animation:pulse 1s infinite; }
+#status-dot.thinking  { background:#f0a500; animation:pulse 0.5s infinite; }
+#status-dot.talking   { background:#4488ff; }
+#status-text { font-size:13px; color:#aaa; letter-spacing:0.5px; }
+#transcript-box {
+  margin-left:auto; font-size:12px; color:#666;
+  max-width:55%; text-align:right;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+/* ── Mic button ── */
+#mic-btn {
+  position:absolute; bottom:52px; left:50%;
+  transform:translateX(-50%);
+  z-index:20; width:64px; height:64px;
+  border-radius:50%; border:none;
+  background:rgba(255,255,255,0.08);
+  backdrop-filter:blur(6px);
+  color:#fff; font-size:28px; cursor:pointer;
+  display:none; transition:background 0.2s, transform 0.1s;
+}
+#mic-btn.show   { display:flex; align-items:center; justify-content:center; }
+#mic-btn.active { background:rgba(0,200,100,0.35); transform:translateX(-50%) scale(1.12); }
+#mic-btn:disabled { opacity:0.3; cursor:not-allowed; }
+
+/* ══════════════════════════════════════════════════
+   PROMPT EDITOR DRAWER
+══════════════════════════════════════════════════ */
+:root {
+  --pe-panel:   #111118;
+  --pe-border:  #1e1e2e;
+  --pe-accent:  #7c6aff;
+  --pe-green:   #4fffb0;
+  --pe-text:    #c9c9e0;
+  --pe-dim:     #4a4a6a;
+  --pe-danger:  #ff5f7e;
+  --pe-radius:  10px;
+}
+
+/* Slide tab */
+#pe-tab {
+  position: fixed;
+  right: 0; top: 50%;
+  transform: translateY(-50%);
+  z-index: 9999;
+  background: var(--pe-accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px 0 0 8px;
+  padding: 14px 8px;
+  cursor: pointer;
+  writing-mode: vertical-rl;
+  font-family: 'Space Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  transition: background 0.2s, padding 0.2s;
+  box-shadow: -3px 0 18px rgba(124,106,255,0.35);
+  display: none;
+}
+#pe-tab.show { display: block; }
+#pe-tab:hover { background: #6655ee; padding: 14px 10px; }
+
+/* Drawer */
+#pe-drawer {
+  position: fixed;
+  right: -460px; top: 0; bottom: 0;
+  width: 460px;
+  background: var(--pe-panel);
+  border-left: 1px solid var(--pe-border);
+  z-index: 9998;
+  display: flex;
+  flex-direction: column;
+  transition: right 0.35s cubic-bezier(0.22,0.61,0.36,1);
+  box-shadow: -8px 0 40px rgba(0,0,0,0.6);
+  font-family: 'Sora', sans-serif;
+}
+#pe-drawer.open { right: 0; }
+
+.pe-header {
+  padding: 20px 22px 16px;
+  border-bottom: 1px solid var(--pe-border);
+  display: flex; align-items: center; gap: 10px;
+  flex-shrink: 0;
+}
+.pe-header h2 {
+  font-family: 'Space Mono', monospace;
+  font-size: 13px; letter-spacing: 1.5px;
+  text-transform: uppercase; color: var(--pe-accent);
+}
+.pe-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--pe-green);
+  box-shadow: 0 0 8px var(--pe-green);
+  margin-left: auto;
+}
+.pe-close {
+  background: none; border: none;
+  color: var(--pe-dim); font-size: 20px;
+  cursor: pointer; line-height: 1;
+  transition: color 0.2s;
+}
+.pe-close:hover { color: var(--pe-danger); }
+
+.pe-body {
+  flex: 1; overflow-y: auto;
+  padding: 20px 22px;
+  display: flex; flex-direction: column; gap: 18px;
+}
+.pe-body::-webkit-scrollbar { width: 4px; }
+.pe-body::-webkit-scrollbar-thumb { background: var(--pe-border); border-radius: 2px; }
+
+.pe-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: rgba(124,106,255,0.1);
+  border: 1px solid rgba(124,106,255,0.25);
+  border-radius: 6px; padding: 5px 10px;
+  font-size: 10px;
+  font-family: 'Space Mono', monospace;
+  color: var(--pe-accent);
+}
+
+.pe-field label {
+  display: block;
+  font-size: 10px;
+  font-family: 'Space Mono', monospace;
+  letter-spacing: 1.5px; text-transform: uppercase;
+  color: var(--pe-dim); margin-bottom: 7px;
+}
+#pe-prompt {
+  width: 100%;
+  background: #0d0d14;
+  border: 1px solid var(--pe-border);
+  border-radius: var(--pe-radius);
+  color: var(--pe-text);
+  font-family: 'Space Mono', monospace;
+  font-size: 11.5px; line-height: 1.65;
+  padding: 10px 12px;
+  resize: none; outline: none;
+  transition: border-color 0.2s;
+  min-height: 80px; max-height: 260px;
+  overflow-y: auto;
+}
+#pe-prompt:focus { border-color: var(--pe-accent); }
+
+.pe-dev-field {
+  width: 100%;
+  background: #0d0d14;
+  border: 1px solid rgba(79,255,176,0.2);
+  border-radius: var(--pe-radius);
+  color: var(--pe-green);
+  font-family: 'Space Mono', monospace;
+  font-size: 11.5px;
+  padding: 10px 12px;
+  cursor: default;
+}
+
+.pe-token-row {
+  display: flex; align-items: center;
+  justify-content: space-between; margin-top: 5px;
+}
+.pe-token-badge {
+  font-size: 10px;
+  font-family: 'Space Mono', monospace;
+  color: var(--pe-dim);
+}
+.pe-token-badge b { color: var(--pe-green); }
+.pe-bar-wrap {
+  flex: 1; height: 3px;
+  background: var(--pe-border);
+  border-radius: 2px; margin: 0 10px; overflow: hidden;
+}
+#pe-bar {
+  height: 100%; width: 0%;
+  background: var(--pe-green);
+  border-radius: 2px;
+  transition: width 0.2s, background 0.2s;
+}
+
+.pe-divider { border: none; border-top: 1px solid var(--pe-border); }
+
+.pe-btn-row {
+  display: flex; gap: 10px;
+  padding: 0 22px 20px; flex-shrink: 0;
+}
+.pe-btn {
+  flex: 1; padding: 11px;
+  border-radius: var(--pe-radius); border: none;
+  font-family: 'Space Mono', monospace;
+  font-size: 11px; letter-spacing: 1px;
+  text-transform: uppercase; cursor: pointer;
+  transition: opacity 0.2s, transform 0.1s;
+}
+.pe-btn:active { transform: scale(0.97); }
+.pe-btn-primary { background: var(--pe-accent); color: #fff; }
+.pe-btn-primary:hover { opacity: 0.85; }
+.pe-btn-ghost {
+  background: transparent;
+  border: 1px solid var(--pe-border);
+  color: var(--pe-dim);
+}
+.pe-btn-ghost:hover { border-color: var(--pe-accent); color: var(--pe-accent); }
+
+.pe-flash {
+  font-size: 10px;
+  font-family: 'Space Mono', monospace;
+  color: var(--pe-green);
+  text-align: center;
+  padding: 0 22px 10px;
+  opacity: 0; transition: opacity 0.3s;
+  flex-shrink: 0;
+}
+.pe-flash.show { opacity: 1; }
 </style>
 </head>
 <body>
 <div id="wrap">
-  <video id="vid-idle"   loop muted playsinline></video>
-  <video id="vid-listen" loop muted playsinline></video>
-  <video id="vid-talk"   loop muted playsinline style="z-index:2"></video>
+
+  <video id="vid-idle"   class="avatar" loop muted playsinline></video>
+  <video id="vid-listen" class="avatar" loop muted playsinline></video>
+
+  <video id="vid-talk-1" class="avatar vid-talk" loop muted playsinline></video>
+  <video id="vid-talk-2" class="avatar vid-talk" loop muted playsinline></video>
+  <video id="vid-talk-3" class="avatar vid-talk" loop muted playsinline></video>
+  <video id="vid-talk-4" class="avatar vid-talk" loop muted playsinline></video>
+  <video id="vid-talk-5" class="avatar vid-talk" loop muted playsinline></video>
+
+  <div id="face-cam">
+    <video id="cam-preview" autoplay muted playsinline></video>
+    <canvas id="cam-canvas"></canvas>
+  </div>
+
+  <div id="status-bar">
+    <div id="status-dot" class="idle"></div>
+    <div id="status-text">Ready</div>
+    <div id="transcript-box"></div>
+  </div>
+
+  <button id="mic-btn" title="Tap to speak">🎙️</button>
 
   <div id="overlay">
-    <div class="icon">🎙️</div>
+    <div class="icon">🏛️</div>
     <div class="title">Museum Guide</div>
-    <div class="sub">Tap anywhere to start</div>
+    <div class="sub">Tap anywhere to begin</div>
   </div>
 
   <div id="loader">
     <div class="spinner"></div>
-    <div style="font-size:14px">Loading...</div>
+    <div style="font-size:14px">Loading videos…</div>
+  </div>
+
+</div>
+
+<!-- ── Prompt Editor Drawer ── -->
+<button id="pe-tab" onclick="peToggle()">⚙ Prompt</button>
+
+<div id="pe-drawer">
+  <div class="pe-header">
+    <h2>⚡ Prompt Config</h2>
+    <div class="pe-dot"></div>
+    <button class="pe-close" onclick="peToggle()">✕</button>
+  </div>
+
+  <div class="pe-body">
+    <div>
+      <span class="pe-chip">🤖 llama-3.1-8b-instant · Groq · max 60 tokens</span>
+    </div>
+
+    <div class="pe-field">
+      <label>System Prompt</label>
+      <textarea id="pe-prompt" spellcheck="false" oninput="peUpdateCount()" onkeydown="if(this.value.length>=500 && event.key.length===1 && !event.ctrlKey && !event.metaKey) event.preventDefault()"></textarea>
+      <div class="pe-token-row">
+        <div class="pe-token-badge">~<b id="pe-chars">0</b> chars</div>
+        <div class="pe-bar-wrap"><div id="pe-bar"></div></div>
+        <div class="pe-token-badge">limit 500</div>
+      </div>
+    </div>
+
+    <!-- Locked suffix is silently appended — not shown to user -->
+
+    <hr class="pe-divider">
+
+    <div class="pe-field">
+      <label>Developer Contact (auto-injected)</label>
+      <div class="pe-dev-field">Moiz Shamshad · WhatsApp: +923216452306</div>
+    </div>
+  </div>
+
+  <div class="pe-flash" id="pe-flash">✓ Prompt saved &amp; sent to server</div>
+
+  <div class="pe-btn-row">
+    <button class="pe-btn pe-btn-ghost" onclick="peReset()">↺ Reset</button>
+    <button class="pe-btn pe-btn-primary" onclick="peSave()">Save &amp; Apply</button>
   </div>
 </div>
 
 <script>
-// ── SERVER URL — auto-detects, works on localhost AND ngrok/mobile ──
-// Uses the same host/port the page was loaded from — no hardcoding needed
+// ══════════════════════════════════════════════════════════════
+//  CONFIG
+// ══════════════════════════════════════════════════════════════
 const SERVER = window.location.origin;
 
-const vidIdle   = document.getElementById("vid-idle");
-const vidListen = document.getElementById("vid-listen");
-const vidTalk   = document.getElementById("vid-talk");
-const overlay   = document.getElementById("overlay");
-const loader    = document.getElementById("loader");
-const audio     = new Audio();
-
-let currentState = "idle";
-
-// ── Show only one video ───────────────────────────────────────
-function showOnly(vid) {
-  vidIdle.style.opacity   = vid === vidIdle   ? "1" : "0";
-  vidListen.style.opacity = vid === vidListen ? "1" : "0";
-  vidTalk.style.opacity   = vid === vidTalk   ? "1" : "0";
+let SID = sessionStorage.getItem("museum_sid");
+if (!SID) {
+  SID = "s_" + Math.random().toString(36).slice(2,10) + "_" + Date.now();
+  sessionStorage.setItem("museum_sid", SID);
 }
 
-// ── IDLE ──────────────────────────────────────────────────────
+const SILENCE_THRESHOLD  = 0.015;
+const SILENCE_SECONDS    = 2.0;
+const MIN_SPEECH_SECONDS = 0.4;
+const MAX_RECORD_SECONDS = 30;
+const FACE_LOST_FRAMES   = 15;
+
+// ══════════════════════════════════════════════════════════════
+//  PROMPT EDITOR
+// ══════════════════════════════════════════════════════════════
+
+// These 2 lines are ALWAYS silently appended — never shown to user, never removable
+const LOCKED_SUFFIX = `Answer in just 1-2 lines, to the point.
+End every reply with one tag: [EMOTION:1] happy [EMOTION:2] sad [EMOTION:3] disappointed [EMOTION:4] shocked [EMOTION:5] neutral`;
+
+// Editable part only (user customises this)
+const DEFAULT_EDITABLE = `Holographic museum guide, Optical Illusions Room (rotating snakes, Müller-Lyer lines, Ames room). Next: Mirror Maze (door right). Dev: Moiz Shamshad WA +923216452306.`;
+
+const CHAR_LIMIT = 500; // limit for the editable part only
+
+function peGetFullPrompt() {
+  const ta = document.getElementById("pe-prompt");
+  return ta.value.trim() + "\n" + LOCKED_SUFFIX;
+}
+
+function peToggle() {
+  document.getElementById("pe-drawer").classList.toggle("open");
+}
+
+function peUpdateCount() {
+  const ta  = document.getElementById("pe-prompt");
+
+  // Enforce char limit — block typing beyond it
+  if (ta.value.length > CHAR_LIMIT) {
+    ta.value = ta.value.slice(0, CHAR_LIMIT);
+  }
+
+  const len = ta.value.length;
+  document.getElementById("pe-chars").textContent = len;
+  const pct = Math.min((len / CHAR_LIMIT) * 100, 100);
+  const bar = document.getElementById("pe-bar");
+  bar.style.width      = pct + "%";
+  bar.style.background = pct > 90 ? "#ff5f7e" : pct > 70 ? "#f0a500" : "#4fffb0";
+  // auto-resize
+  ta.style.height = "auto";
+  ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
+}
+
+function peReset() {
+  const ta = document.getElementById("pe-prompt");
+  ta.value = DEFAULT_EDITABLE;
+  localStorage.removeItem("museum_system_prompt_editable");
+  peUpdateCount();
+}
+
+async function peSave() {
+  const ta     = document.getElementById("pe-prompt");
+  const editable = ta.value.trim();
+  if (!editable) return;
+
+  // Save editable part only
+  localStorage.setItem("museum_system_prompt_editable", editable);
+
+  // Full prompt = editable + locked suffix
+  const fullPrompt = peGetFullPrompt();
+
+  // Send full prompt to server
+  try {
+    await fetch(SERVER + "/set-prompt/" + SID, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ prompt: fullPrompt }),
+    });
+  } catch(e) {
+    console.warn("Could not push prompt to server:", e);
+  }
+
+  const flash = document.getElementById("pe-flash");
+  flash.classList.add("show");
+  setTimeout(() => flash.classList.remove("show"), 2500);
+}
+
+// Push saved prompt to server as soon as SSE connects
+async function pePushSavedPrompt() {
+  const fullPrompt = peGetFullPrompt();
+  try {
+    await fetch(SERVER + "/set-prompt/" + SID, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ prompt: fullPrompt }),
+    });
+    console.log("Restored saved prompt to server session");
+  } catch(e) {}
+}
+
+// Init textarea
+(function() {
+  const ta    = document.getElementById("pe-prompt");
+  const saved = localStorage.getItem("museum_system_prompt_editable");
+  ta.value    = saved || DEFAULT_EDITABLE;
+  peUpdateCount();
+})();
+
+// ══════════════════════════════════════════════════════════════
+//  DOM
+// ══════════════════════════════════════════════════════════════
+const vidIdle       = document.getElementById("vid-idle");
+const vidListen     = document.getElementById("vid-listen");
+const overlay       = document.getElementById("overlay");
+const loader        = document.getElementById("loader");
+const statusBar     = document.getElementById("status-bar");
+const statusDot     = document.getElementById("status-dot");
+const statusText    = document.getElementById("status-text");
+const transcriptBox = document.getElementById("transcript-box");
+const faceCamDiv    = document.getElementById("face-cam");
+const camPreview    = document.getElementById("cam-preview");
+const camCanvas     = document.getElementById("cam-canvas");
+const micBtn        = document.getElementById("mic-btn");
+
+const talkVids = {
+  1: document.getElementById("vid-talk-1"),
+  2: document.getElementById("vid-talk-2"),
+  3: document.getElementById("vid-talk-3"),
+  4: document.getElementById("vid-talk-4"),
+  5: document.getElementById("vid-talk-5"),
+};
+const allVids = [vidIdle, vidListen, ...Object.values(talkVids)];
+
+// ══════════════════════════════════════════════════════════════
+//  STATE
+// ══════════════════════════════════════════════════════════════
+let currentState   = "idle";
+let mediaRecorder  = null;
+let audioChunks    = [];
+let micStream      = null;
+let audioCtx       = null;
+let analyser       = null;
+let recordingTimer = null;
+let vadInterval    = null;
+let speechStart    = null;
+let silenceFrames  = 0;
+let speechFrames   = 0;
+let speechDetected = false;
+let faceInterval   = null;
+let faceLostFrames = 0;
+let faceWasPresent = false;
+let isBusy         = false;
+
+const ttsAudio = new Audio();
+
+// ══════════════════════════════════════════════════════════════
+//  VIDEO
+// ══════════════════════════════════════════════════════════════
+function showOnly(vid) {
+  allVids.forEach(v => { v.style.opacity = (v === vid) ? "1" : "0"; });
+}
+
 function goIdle() {
   currentState = "idle";
-  vidTalk.pause();
+  isBusy       = false;
+  Object.values(talkVids).forEach(v => v.pause());
   vidListen.pause();
   if (vidIdle.paused) vidIdle.play().catch(() => {});
   showOnly(vidIdle);
+  setStatus("idle", "Ready — look at the camera to speak");
+  setTimeout(() => {
+    faceWasPresent = false;
+    console.log("Face trigger reset — ready for next question");
+  }, 1500);
 }
 
-// ── LISTENING ─────────────────────────────────────────────────
 function goListening() {
   if (currentState === "listening") return;
   currentState = "listening";
-  vidTalk.pause();
+  Object.values(talkVids).forEach(v => v.pause());
   vidListen.currentTime = 0;
   vidListen.play().catch(() => {});
   showOnly(vidListen);
+  setStatus("listening", "Listening…");
 }
 
-// ── TALKING ───────────────────────────────────────────────────
+function goThinking() {
+  currentState = "thinking";
+  isBusy       = true;
+  showOnly(vidListen);
+  setStatus("thinking", "Thinking…");
+}
+
 function goTalking(emotionNum, audioUrl) {
   currentState = "talking";
+  isBusy       = true;
+  const vid = talkVids[emotionNum] || talkVids[5];
+  showOnly(vid);
+  vid.currentTime = 0;
+  vid.play().catch(() => {});
+  setStatus("talking", "Speaking…");
+  setTimeout(() => {
+    ttsAudio.src = audioUrl + "&cb=" + Date.now();
+    ttsAudio.play().catch(() => {
+      setTimeout(() => ttsAudio.play().catch(() => {}), 300);
+    });
+  }, 80);
+}
 
-  const talkUrl = SERVER + "/video/talk/" + emotionNum + "?cb=" + Date.now();
-  vidTalk.src = talkUrl;
-  vidTalk.load();
+ttsAudio.addEventListener("ended", () => {
+  fetch(SERVER + "/done/" + SID, { method:"POST" }).catch(() => {});
+  goIdle();
+});
+ttsAudio.addEventListener("error", () => {
+  fetch(SERVER + "/done/" + SID, { method:"POST" }).catch(() => {});
+  goIdle();
+});
 
-  // Timeout fallback — if canplay never fires (slow network), start after 1.5s
-  let started = false;
-  const fallback = setTimeout(() => {
-    if (!started) {
-      started = true;
-      vidTalk.play().catch(() => {});
-      showOnly(vidTalk);
-      playAudio(audioUrl);
-    }
-  }, 1500);
-
-  vidTalk.oncanplay = () => {
-    if (started) return;
-    started = true;
-    clearTimeout(fallback);
-    vidTalk.currentTime = 0;
-    vidTalk.play().catch(() => {});
-    showOnly(vidTalk);
-    vidTalk.oncanplay = null;
-    setTimeout(() => playAudio(audioUrl), 150);
+function speakFallback(text, lang, emotionNum) {
+  if (!window.speechSynthesis) { goIdle(); return; }
+  const vid = talkVids[emotionNum] || talkVids[5];
+  currentState = "talking"; isBusy = true;
+  showOnly(vid); vid.currentTime = 0; vid.play().catch(() => {});
+  setStatus("talking", "Speaking…");
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.lang  = lang || "en";
+  utt.onend = utt.onerror = () => {
+    fetch(SERVER + "/done/" + SID, { method:"POST" }).catch(() => {});
+    goIdle();
   };
+  speechSynthesis.speak(utt);
 }
 
-function playAudio(url) {
-  audio.src = url + "&cb2=" + Date.now();
-  // On mobile, play() must be called directly after a user gesture
-  // The tap on overlay counts as the gesture, so this works
-  audio.play().catch(e => {
-    console.warn("audio blocked:", e);
-    // If blocked, try once more after short delay
-    setTimeout(() => audio.play().catch(() => {}), 300);
-  });
+// ══════════════════════════════════════════════════════════════
+//  STATUS
+// ══════════════════════════════════════════════════════════════
+function setStatus(state, text) {
+  statusDot.className    = state;
+  statusText.textContent = text;
 }
 
-// ── Audio ends → back to idle ─────────────────────────────────
-audio.addEventListener("ended", goIdle);
-audio.addEventListener("error", () => { console.warn("audio error"); goIdle(); });
-
-// ── SSE ───────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+//  SSE
+// ══════════════════════════════════════════════════════════════
 function connectSSE() {
-  const es = new EventSource(SERVER + "/events");
-
-  es.onmessage = (evt) => {
-    let msg;
-    try { msg = JSON.parse(evt.data); } catch { return; }
-
-    if (msg.type === "state") {
-      if (msg.data === "idle" && currentState !== "talking")     goIdle();
-      if (msg.data === "listening")                               goListening();
-      if (msg.data === "thinking" && currentState !== "talking") goListening();
+  const es = new EventSource(SERVER + "/events/" + SID);
+  es.onmessage = evt => {
+    let msg; try { msg = JSON.parse(evt.data); } catch { return; }
+    if (msg.type === "connected") {
+      // Push any saved custom prompt as soon as session is live
+      pePushSavedPrompt();
     }
-
+    if (msg.type === "state") {
+      if (msg.data === "idle"    && currentState !== "talking") goIdle();
+      if (msg.data === "thinking")                              goThinking();
+    }
+    if (msg.type === "transcript") transcriptBox.textContent = "You: " + msg.data;
     if (msg.type === "speak") {
       const p = JSON.parse(msg.data);
-      // audio_url from server still has localhost — replace with current host
-      const fixedAudioUrl = p.audio_url.replace(/http:\/\/[^/]+/, SERVER);
-      goTalking(p.emotion, fixedAudioUrl);
+      goTalking(p.emotion, p.audio_url);
+    }
+    if (msg.type === "speak_fallback") {
+      const p = JSON.parse(msg.data);
+      speakFallback(p.text, p.language, p.emotion);
     }
   };
-
-  es.onerror = () => {
-    es.close();
-    setTimeout(connectSSE, 3000);
-  };
+  es.onerror = () => { es.close(); setTimeout(connectSSE, 3000); };
 }
 
-// ── Tap to start ──────────────────────────────────────────────
-overlay.addEventListener("click", () => {
+// ══════════════════════════════════════════════════════════════
+//  MIC RECORDING
+// ══════════════════════════════════════════════════════════════
+async function getMicStream() {
+  if (micStream && micStream.active) return micStream;
+  micStream = await navigator.mediaDevices.getUserMedia({ audio:true, video:false });
+  return micStream;
+}
+
+async function startRecording() {
+  if (isBusy || currentState === "listening") return;
+  goListening();
+
+  let stream;
+  try { stream = await getMicStream(); }
+  catch (e) { console.error("Mic denied:", e); goIdle(); return; }
+
+  if (!audioCtx || audioCtx.state === "closed")
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === "suspended") await audioCtx.resume();
+
+  const source = audioCtx.createMediaStreamSource(stream);
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 1024;
+  source.connect(analyser);
+  const pcmData = new Float32Array(analyser.fftSize);
+
+  audioChunks    = [];
+  speechDetected = false;
+  speechFrames   = 0;
+  silenceFrames  = 0;
+  speechStart    = null;
+
+  const mimeType = ["audio/webm;codecs=opus","audio/webm","audio/ogg;codecs=opus",
+                    "audio/ogg","audio/mp4"].find(m => MediaRecorder.isTypeSupported(m)) || "";
+
+  mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+  mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+  mediaRecorder.onstop = sendAudio;
+  mediaRecorder.start(200);
+
+  vadInterval = setInterval(() => {
+    analyser.getFloatTimeDomainData(pcmData);
+    const rms = Math.sqrt(pcmData.reduce((s,v) => s + v*v, 0) / pcmData.length);
+    if (rms > SILENCE_THRESHOLD) {
+      speechFrames++; silenceFrames = 0;
+      if (!speechDetected && speechFrames >= 3) {
+        speechDetected = true; speechStart = Date.now();
+        console.log("VAD: speech");
+      }
+    } else if (speechDetected) {
+      silenceFrames++;
+      if (silenceFrames * 0.1 >= SILENCE_SECONDS) {
+        console.log("VAD: silence → stop"); stopRecording();
+      }
+    }
+  }, 100);
+
+  recordingTimer = setTimeout(() => { console.log("Max time"); stopRecording(); },
+    MAX_RECORD_SECONDS * 1000);
+}
+
+function stopRecording() {
+  clearInterval(vadInterval); clearTimeout(recordingTimer); vadInterval = null;
+  if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
+}
+
+async function sendAudio() {
+  if (!audioChunks.length) { goIdle(); return; }
+  const spokenSec = speechStart ? (Date.now() - speechStart) / 1000 : 0;
+  if (!speechDetected || spokenSec < MIN_SPEECH_SECONDS) {
+    console.log("Too short — ignoring"); goIdle(); return;
+  }
+  const mimeType = mediaRecorder.mimeType || "audio/webm";
+  const blob     = new Blob(audioChunks, { type: mimeType });
+  console.log("Sending:", blob.size, "bytes");
+  goThinking();
+  try {
+    const resp = await fetch(SERVER + "/transcribe/" + SID, {
+      method:"POST", headers:{"Content-Type": mimeType}, body: blob,
+    });
+    if (!resp.ok) throw new Error("Server " + resp.status);
+  } catch (e) { console.error("Upload:", e); goIdle(); }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  FACE DETECTION
+// ══════════════════════════════════════════════════════════════
+let faceApiReady = false;
+
+async function loadFaceApi() {
+  await new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src   = "https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js";
+    s.onload = res; s.onerror = rej;
+    document.head.appendChild(s);
+  });
+  await faceapi.nets.tinyFaceDetector.loadFromUri(
+    "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model"
+  );
+  faceApiReady = true;
+  console.log("face-api ready");
+}
+
+async function startFaceDetection(camStream) {
+  camPreview.srcObject = camStream;
+  faceCamDiv.style.display = "block";
+  const opts = new faceapi.TinyFaceDetectorOptions({ inputSize:160, scoreThreshold:0.5 });
+
+  faceInterval = setInterval(async () => {
+    if (!faceApiReady) return;
+    try {
+      const det         = await faceapi.detectSingleFace(camPreview, opts);
+      const facePresent = !!det;
+
+      const ctx = camCanvas.getContext("2d");
+      camCanvas.width  = camPreview.videoWidth  || 120;
+      camCanvas.height = camPreview.videoHeight || 90;
+      ctx.clearRect(0, 0, camCanvas.width, camCanvas.height);
+      if (facePresent && det.box) {
+        const scaleX = camCanvas.width  / (camPreview.videoWidth  || 1);
+        const scaleY = camCanvas.height / (camPreview.videoHeight || 1);
+        const b = det.box;
+        ctx.strokeStyle = "#00cc66"; ctx.lineWidth = 2;
+        ctx.strokeRect(
+          camCanvas.width - (b.x + b.width) * scaleX,
+          b.y * scaleY, b.width * scaleX, b.height * scaleY
+        );
+      }
+
+      if (facePresent) {
+        faceLostFrames = 0;
+        if (!faceWasPresent) {
+          faceWasPresent = true;
+          if (!isBusy) {
+            console.log("Face appeared — start recording");
+            startRecording();
+          } else {
+            console.log("Face appeared but busy — will trigger after answer");
+          }
+        }
+      } else {
+        faceLostFrames++;
+        if (faceWasPresent && faceLostFrames >= FACE_LOST_FRAMES) {
+          faceWasPresent = false;
+          faceLostFrames = 0;
+          console.log("Face gone");
+          if (currentState === "listening") stopRecording();
+        }
+      }
+    } catch(e) { /* non-fatal */ }
+  }, 100);
+}
+
+// ══════════════════════════════════════════════════════════════
+//  MIC BUTTON
+// ══════════════════════════════════════════════════════════════
+micBtn.addEventListener("click", async () => {
+  if (isBusy) return;
+  if (currentState === "listening") {
+    stopRecording(); micBtn.classList.remove("active");
+  } else {
+    micBtn.classList.add("active");
+    await startRecording();
+    if (mediaRecorder) mediaRecorder.addEventListener("stop",
+      () => micBtn.classList.remove("active"), { once:true });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  STARTUP
+// ══════════════════════════════════════════════════════════════
+overlay.addEventListener("click", async () => {
   overlay.classList.add("hidden");
   loader.classList.add("show");
 
-  // Unlock audio on mobile — MUST happen inside tap handler
-  audio.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAwF0AAIC7AAACABAAZGFOYQAAAAo=";
-  audio.play().then(() => { audio.src = ""; }).catch(() => {});
+  ttsAudio.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAwF0AAIC7AAACABAAZGFOYQAAAAo=";
+  ttsAudio.play().then(() => { ttsAudio.src = ""; }).catch(() => {});
 
-  // Load idle video
   vidIdle.src = SERVER + "/video/idle";
   vidIdle.load();
+  await new Promise(res => {
+    vidIdle.oncanplay = () => { vidIdle.oncanplay = null; res(); };
+    setTimeout(res, 3000);
+  });
+  vidIdle.play().catch(() => {});
+  showOnly(vidIdle);
+  currentState = "idle";
+  loader.classList.remove("show");
 
-  vidIdle.oncanplay = () => {
-    vidIdle.oncanplay = null;
-    loader.classList.remove("show");
-    vidIdle.play().catch(() => {});
-    showOnly(vidIdle);
-    currentState = "idle";
+  vidListen.src = SERVER + "/video/listening";
+  vidListen.load();
 
-    // Silently preload listening video
-    vidListen.src = SERVER + "/video/listening";
-    vidListen.load();
-    vidListen.play().catch(() => {});
-    vidListen.pause();
-    vidListen.currentTime = 0;
-  };
+  Object.entries(talkVids).forEach(([num, vid]) => {
+    vid.src = SERVER + "/video/talk/" + num;
+    vid.load();
+    vid.oncanplay = () => { vid.oncanplay = null; console.log("talk-" + num + " ready"); };
+  });
 
+  statusBar.classList.add("show");
+  micBtn.classList.add("show");
+  document.getElementById("pe-tab").classList.add("show");  // show prompt tab
+  setStatus("idle", "Ready");
   connectSSE();
+
+  try {
+    const camStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode:"user", width:320, height:240 }, audio:false,
+    });
+    await loadFaceApi();
+    await startFaceDetection(camStream);
+    setStatus("idle", "Ready — look at the camera to speak");
+  } catch(e) {
+    console.warn("No camera/face-api — mic button mode:", e);
+    setStatus("idle", "Ready — tap 🎙️ to speak");
+    faceCamDiv.style.display = "none";
+  }
 });
 </script>
 </body>

@@ -21,7 +21,6 @@ checkpoints/
 *.onnx
 
 # Media output files
-*.mp4
 *.mp3
 *.wav
 *.avi
@@ -39,3 +38,5 @@ Thumbs.db
 # Editor
 .vscode/
 .idea/
+
+museum-guide.tar
