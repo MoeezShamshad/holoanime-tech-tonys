@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Museum Guide</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Sora:wght@300;400;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.19/dist/bundle.min.js"></script>
 <style>
 /* ══════════════════════════════════════════════════
    BASE
@@ -306,8 +308,9 @@ video.avatar {
 <body>
 <div id="wrap">
 
-  <video id="vid-idle"   class="avatar" loop muted playsinline></video>
-  <video id="vid-listen" class="avatar" loop muted playsinline></video>
+  <video id="vid-idle"    class="avatar" loop muted playsinline></video>
+  <video id="vid-listen"  class="avatar" loop muted playsinline></video>
+  <video id="vid-think"   class="avatar" loop muted playsinline></video>
 
   <video id="vid-talk-1" class="avatar vid-talk" loop muted playsinline></video>
   <video id="vid-talk-2" class="avatar vid-talk" loop muted playsinline></video>
@@ -396,11 +399,8 @@ if (!SID) {
   sessionStorage.setItem("museum_sid", SID);
 }
 
-const SILENCE_THRESHOLD  = 0.015;
-const SILENCE_SECONDS    = 2.0;
-const MIN_SPEECH_SECONDS = 0.4;
-const MAX_RECORD_SECONDS = 30;
-const FACE_LOST_FRAMES   = 15;
+const FACE_LOST_FRAMES = 15;
+let   vadInstance     = null;
 
 // ══════════════════════════════════════════════════════════════
 //  PROMPT EDITOR
@@ -503,6 +503,7 @@ async function pePushSavedPrompt() {
 // ══════════════════════════════════════════════════════════════
 const vidIdle       = document.getElementById("vid-idle");
 const vidListen     = document.getElementById("vid-listen");
+const vidThink      = document.getElementById("vid-think");
 const overlay       = document.getElementById("overlay");
 const loader        = document.getElementById("loader");
 const statusBar     = document.getElementById("status-bar");
@@ -521,23 +522,12 @@ const talkVids = {
   4: document.getElementById("vid-talk-4"),
   5: document.getElementById("vid-talk-5"),
 };
-const allVids = [vidIdle, vidListen, ...Object.values(talkVids)];
+const allVids = [vidIdle, vidListen, vidThink, ...Object.values(talkVids)];
 
 // ══════════════════════════════════════════════════════════════
 //  STATE
 // ══════════════════════════════════════════════════════════════
 let currentState   = "idle";
-let mediaRecorder  = null;
-let audioChunks    = [];
-let micStream      = null;
-let audioCtx       = null;
-let analyser       = null;
-let recordingTimer = null;
-let vadInterval    = null;
-let speechStart    = null;
-let silenceFrames  = 0;
-let speechFrames   = 0;
-let speechDetected = false;
 let faceInterval   = null;
 let faceLostFrames = 0;
 let faceWasPresent = false;
@@ -554,15 +544,23 @@ function showOnly(vid) {
 
 function goIdle() {
   currentState = "idle";
-  isBusy       = false;
+  isBusy = false;
+
+  // ✅ ensure VAD is active again
+  if (vadInstance && !vadInstance.listening) {
+    vadInstance.start();
+  }
+
   Object.values(talkVids).forEach(v => v.pause());
   vidListen.pause();
+
   if (vidIdle.paused) vidIdle.play().catch(() => {});
   showOnly(vidIdle);
+
   setStatus("idle", "Ready — look at the camera to speak");
+
   setTimeout(() => {
     faceWasPresent = false;
-    console.log("Face trigger reset — ready for next question");
   }, 1500);
 }
 
@@ -579,18 +577,28 @@ function goListening() {
 function goThinking() {
   currentState = "thinking";
   isBusy       = true;
-  showOnly(vidListen);
+  vidListen.pause();
+  vidThink.currentTime = 0;
+  vidThink.play().catch(() => {});
+  showOnly(vidThink);
   setStatus("thinking", "Thinking…");
 }
 
 function goTalking(emotionNum, audioUrl) {
   currentState = "talking";
-  isBusy       = true;
+  isBusy = true;
+
+  // ✅ STOP VAD so it does not hear AI voice
+  if (vadInstance) vadInstance.pause();
+
   const vid = talkVids[emotionNum] || talkVids[5];
   showOnly(vid);
+
   vid.currentTime = 0;
   vid.play().catch(() => {});
+
   setStatus("talking", "Speaking…");
+
   setTimeout(() => {
     ttsAudio.src = audioUrl + "&cb=" + Date.now();
     ttsAudio.play().catch(() => {
@@ -601,25 +609,50 @@ function goTalking(emotionNum, audioUrl) {
 
 ttsAudio.addEventListener("ended", () => {
   fetch(SERVER + "/done/" + SID, { method:"POST" }).catch(() => {});
-  goIdle();
-});
-ttsAudio.addEventListener("error", () => {
-  fetch(SERVER + "/done/" + SID, { method:"POST" }).catch(() => {});
+
+  // ✅ Restart VAD after speaking
+  if (vadInstance) vadInstance.start();
+
   goIdle();
 });
 
+ttsAudio.addEventListener("error", () => {
+  fetch(SERVER + "/done/" + SID, { method:"POST" }).catch(() => {});
+
+  if (vadInstance) vadInstance.start();
+
+  goIdle();
+});
+
+
+
 function speakFallback(text, lang, emotionNum) {
   if (!window.speechSynthesis) { goIdle(); return; }
+
+  // ✅ STOP VAD here also
+  if (vadInstance) vadInstance.pause();
+
   const vid = talkVids[emotionNum] || talkVids[5];
-  currentState = "talking"; isBusy = true;
-  showOnly(vid); vid.currentTime = 0; vid.play().catch(() => {});
+  currentState = "talking";
+  isBusy = true;
+
+  showOnly(vid);
+  vid.currentTime = 0;
+  vid.play().catch(() => {});
   setStatus("talking", "Speaking…");
+
   const utt = new SpeechSynthesisUtterance(text);
   utt.lang  = lang || "en";
+
   utt.onend = utt.onerror = () => {
     fetch(SERVER + "/done/" + SID, { method:"POST" }).catch(() => {});
+
+    // ✅ restart VAD
+    if (vadInstance) vadInstance.start();
+
     goIdle();
   };
+
   speechSynthesis.speak(utt);
 }
 
@@ -660,88 +693,98 @@ function connectSSE() {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  MIC RECORDING
+//  VAD — @ricky0123/vad-web (AI speech detection)
 // ══════════════════════════════════════════════════════════════
-async function getMicStream() {
-  if (micStream && micStream.active) return micStream;
-  micStream = await navigator.mediaDevices.getUserMedia({ audio:true, video:false });
-  return micStream;
+
+// Convert Float32 PCM from VAD → WAV blob
+function float32ToWav(samples, sampleRate) {
+  const buf  = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buf);
+  const str  = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, "RIFF");
+  view.setUint32(4,  36 + samples.length * 2, true);
+  str(8, "WAVE"); str(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1,  true);
+  view.setUint16(22, 1,  true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2,  true);
+  view.setUint16(34, 16, true);
+  str(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+  samples.forEach((s, i) => view.setInt16(44 + i * 2, Math.max(-1, Math.min(1, s)) * 0x7FFF, true));
+  return new Blob([buf], { type: "audio/wav" });
 }
 
-async function startRecording() {
+async function initVAD() {
+  try {
+    vadInstance = await vad.MicVAD.new({
+      positiveSpeechThreshold: 0.85,
+      negativeSpeechThreshold: 0.35,
+      minSpeechFrames: 4,
+      preSpeechPadFrames: 5,
+      redemptionFrames: 8,
+
+      onSpeechStart: () => {
+        // ✅ Block when AI is speaking or busy
+        if (isBusy || currentState === "talking") return;
+
+        console.log("VAD: speech started");
+        goListening();
+      },
+
+      onSpeechEnd: async (audio) => {
+        // ✅ Prevent self-trigger loop
+        if (isBusy || currentState === "talking") return;
+
+        console.log("VAD: speech ended — processing");
+        goThinking();
+
+        const wav = float32ToWav(audio, 16000);
+
+        try {
+          const resp = await fetch(SERVER + "/transcribe/" + SID, {
+            method: "POST",
+            headers: { "Content-Type": "audio/wav" },
+            body: wav,
+          });
+
+          if (!resp.ok) throw new Error("Server " + resp.status);
+        } catch (e) {
+          console.error("Upload error:", e);
+          goIdle();
+        }
+      },
+
+      onVADMisfire: () => {
+        console.log("VAD: misfire — too short");
+
+        // ✅ Only reset if actually listening
+        if (currentState === "listening" && !isBusy) {
+          goIdle();
+        }
+      },
+    });
+
+    // ✅ Start VAD safely
+    if (vadInstance) {
+      vadInstance.start();
+    }
+
+    console.log("VAD ready ✓");
+
+  } catch (e) {
+    console.error("VAD init failed:", e);
+  }
+}
+function startRecording() {
   if (isBusy || currentState === "listening") return;
   goListening();
-
-  let stream;
-  try { stream = await getMicStream(); }
-  catch (e) { console.error("Mic denied:", e); goIdle(); return; }
-
-  if (!audioCtx || audioCtx.state === "closed")
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  if (audioCtx.state === "suspended") await audioCtx.resume();
-
-  const source = audioCtx.createMediaStreamSource(stream);
-  analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 1024;
-  source.connect(analyser);
-  const pcmData = new Float32Array(analyser.fftSize);
-
-  audioChunks    = [];
-  speechDetected = false;
-  speechFrames   = 0;
-  silenceFrames  = 0;
-  speechStart    = null;
-
-  const mimeType = ["audio/webm;codecs=opus","audio/webm","audio/ogg;codecs=opus",
-                    "audio/ogg","audio/mp4"].find(m => MediaRecorder.isTypeSupported(m)) || "";
-
-  mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
-  mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
-  mediaRecorder.onstop = sendAudio;
-  mediaRecorder.start(200);
-
-  vadInterval = setInterval(() => {
-    analyser.getFloatTimeDomainData(pcmData);
-    const rms = Math.sqrt(pcmData.reduce((s,v) => s + v*v, 0) / pcmData.length);
-    if (rms > SILENCE_THRESHOLD) {
-      speechFrames++; silenceFrames = 0;
-      if (!speechDetected && speechFrames >= 3) {
-        speechDetected = true; speechStart = Date.now();
-        console.log("VAD: speech");
-      }
-    } else if (speechDetected) {
-      silenceFrames++;
-      if (silenceFrames * 0.1 >= SILENCE_SECONDS) {
-        console.log("VAD: silence → stop"); stopRecording();
-      }
-    }
-  }, 100);
-
-  recordingTimer = setTimeout(() => { console.log("Max time"); stopRecording(); },
-    MAX_RECORD_SECONDS * 1000);
 }
 
 function stopRecording() {
-  clearInterval(vadInterval); clearTimeout(recordingTimer); vadInterval = null;
-  if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
-}
-
-async function sendAudio() {
-  if (!audioChunks.length) { goIdle(); return; }
-  const spokenSec = speechStart ? (Date.now() - speechStart) / 1000 : 0;
-  if (!speechDetected || spokenSec < MIN_SPEECH_SECONDS) {
-    console.log("Too short — ignoring"); goIdle(); return;
-  }
-  const mimeType = mediaRecorder.mimeType || "audio/webm";
-  const blob     = new Blob(audioChunks, { type: mimeType });
-  console.log("Sending:", blob.size, "bytes");
-  goThinking();
-  try {
-    const resp = await fetch(SERVER + "/transcribe/" + SID, {
-      method:"POST", headers:{"Content-Type": mimeType}, body: blob,
-    });
-    if (!resp.ok) throw new Error("Server " + resp.status);
-  } catch (e) { console.error("Upload:", e); goIdle(); }
+  if (currentState === "listening") goIdle();
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -794,8 +837,8 @@ async function startFaceDetection(camStream) {
         if (!faceWasPresent) {
           faceWasPresent = true;
           if (!isBusy) {
-            console.log("Face appeared — start recording");
-            startRecording();
+            console.log("Face appeared — VAD listening");
+            goListening();
           } else {
             console.log("Face appeared but busy — will trigger after answer");
           }
@@ -816,15 +859,19 @@ async function startFaceDetection(camStream) {
 // ══════════════════════════════════════════════════════════════
 //  MIC BUTTON
 // ══════════════════════════════════════════════════════════════
-micBtn.addEventListener("click", async () => {
+micBtn.addEventListener("click", () => {
   if (isBusy) return;
   if (currentState === "listening") {
-    stopRecording(); micBtn.classList.remove("active");
+    goIdle(); micBtn.classList.remove("active");
   } else {
     micBtn.classList.add("active");
-    await startRecording();
-    if (mediaRecorder) mediaRecorder.addEventListener("stop",
-      () => micBtn.classList.remove("active"), { once:true });
+    goListening();
+    const checkIdle = setInterval(() => {
+      if (currentState !== "listening") {
+        micBtn.classList.remove("active");
+        clearInterval(checkIdle);
+      }
+    }, 200);
   }
 });
 
@@ -852,6 +899,9 @@ overlay.addEventListener("click", async () => {
   vidListen.src = SERVER + "/video/listening";
   vidListen.load();
 
+  vidThink.src = SERVER + "/video/thinking";
+  vidThink.load();
+
   Object.entries(talkVids).forEach(([num, vid]) => {
     vid.src = SERVER + "/video/talk/" + num;
     vid.load();
@@ -863,6 +913,7 @@ overlay.addEventListener("click", async () => {
   document.getElementById("pe-tab").classList.add("show");  // show prompt tab
   setStatus("idle", "Ready");
   connectSSE();
+  await initVAD();   // start AI-powered VAD
 
   try {
     const camStream = await navigator.mediaDevices.getUserMedia({

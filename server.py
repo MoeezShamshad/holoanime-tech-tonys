@@ -24,6 +24,7 @@ PORT         = 5000
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 IDLE_VIDEO      = os.path.join(BASE_DIR, "idle.mp4")
 LISTENING_VIDEO = os.path.join(BASE_DIR, "listening.mp4")
+THINKING_VIDEO  = os.path.join(BASE_DIR, "thinking.mp4")
 
 TALKING_VIDEOS = {
     1: os.path.join(BASE_DIR, "talk_1.mp4"),
@@ -39,14 +40,19 @@ sessions      = {}
 sessions_lock = threading.Lock()
 
 # ── Default System Prompt ──────────────────────────────────────
-# These 2 lines are always forcefully appended to every prompt
-LOCKED_SUFFIX = """Answer in just 1-2 lines, to the point.
-End every reply with one tag: [EMOTION:1] happy [EMOTION:2] sad [EMOTION:3] disappointed [EMOTION:4] shocked [EMOTION:5] neutral"""
+# Locked suffix — always appended, never removable, kept minimal for speed
+LOCKED_SUFFIX = (
+    "Max 2 sentences. Match visitor tone: "
+    "[EMOTION:1]friendly [EMOTION:2]sad [EMOTION:3]angry/rude [EMOTION:4]surprised [EMOTION:5]neutral. "
+    "End reply with one silent tag. Never speak the tag."
+)
 
-# Base default prompt
-_BASE_PROMPT = """You are a holographic museum guide in the Optical Illusions Room (rotating snakes, Müller-Lyer lines, Ames room). Next room: Mirror Maze (door on the right). Respond in the visitor's language.
-If asked who made you or who is your developer, say only: Moiz Shamshad.
-IMPORTANT: Never say or describe your emotion. Never say words like happy, sad, neutral, shocked, disappointed. The [EMOTION:X] tag is silent metadata — never speak it."""
+# Base default prompt — kept short for speed
+_BASE_PROMPT = (
+    "Holographic museum guide, Optical Illusions Room (rotating snakes, Müller-Lyer lines, Ames room). "
+    "Next: Mirror Maze, door right. Reply in visitor's language. "
+    "Developer: Moiz Shamshad."
+)
 
 SYSTEM_PROMPT = _BASE_PROMPT + "\n" + LOCKED_SUFFIX
 
@@ -421,6 +427,16 @@ async def serve_listening():
         return FileResponse(IDLE_VIDEO, media_type="video/mp4")
     return Response(content="listening.mp4 not found", status_code=404)
 
+@app.get("/video/thinking")
+async def serve_thinking():
+    if os.path.exists(THINKING_VIDEO):
+        return FileResponse(THINKING_VIDEO, media_type="video/mp4")
+    if os.path.exists(LISTENING_VIDEO):
+        return FileResponse(LISTENING_VIDEO, media_type="video/mp4")
+    if os.path.exists(IDLE_VIDEO):
+        return FileResponse(IDLE_VIDEO, media_type="video/mp4")
+    return Response(content="thinking.mp4 not found", status_code=404)
+
 @app.get("/video/talk/{emotion}")
 async def serve_talk(emotion: int):
     path = get_talking_video_path(emotion)
@@ -483,6 +499,8 @@ if __name__ == "__main__":
     print("  [{}] idle.mp4".format("OK" if os.path.exists(IDLE_VIDEO) else "MISSING"))
     print("  [{}] listening.mp4".format(
         "OK" if os.path.exists(LISTENING_VIDEO) else "MISSING"))
+    print("  [{}] thinking.mp4".format(
+        "OK" if os.path.exists(THINKING_VIDEO) else "MISSING"))
     print()
     for n, name in emotion_names.items():
         path   = TALKING_VIDEOS[n]
