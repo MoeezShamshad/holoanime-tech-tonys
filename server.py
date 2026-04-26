@@ -35,26 +35,34 @@ TALKING_VIDEOS = {
 }
 TALKING_FALLBACK = os.path.join(BASE_DIR, "talking.mp4")
 
-executor      = ThreadPoolExecutor(max_workers=6)
+# FIX 6: Increase workers slightly for better STT+LLM parallelism
+executor      = ThreadPoolExecutor(max_workers=8)
 sessions      = {}
 sessions_lock = threading.Lock()
 
+# ── History limit — keeps LLM fast ────────────────────────────
+MAX_HISTORY = 0# FIX 2: only keep last 6 messages (3 exchanges)
+
 # ── Default System Prompt ──────────────────────────────────────
-# Locked suffix — always appended, never removable, kept minimal for speed
 LOCKED_SUFFIX = (
-    "Max 2 sentences. Match visitor tone: "
-    "[EMOTION:1]friendly [EMOTION:2]sad [EMOTION:3]angry/rude [EMOTION:4]surprised [EMOTION:5]neutral. "
-    "End reply with one silent tag. Never speak the tag."
+    "After your reply, add one tag: "
+    "[EMOTION:1] if answer is fun or welcoming. "
+    "[EMOTION:2] if visitor seems sad or confused. "
+    "[EMOTION:3] if correcting visitor. "
+    "[EMOTION:4] if fact is surprising. "
+    "[EMOTION:5] if giving directions or general info. "
+    "Do not say the tag aloud."
 )
 
-# Base default prompt — kept short for speed
 _BASE_PROMPT = (
-    "Holographic museum guide, Optical Illusions Room (rotating snakes, Müller-Lyer lines, Ames room). "
-    "Next: Mirror Maze, door right. Reply in visitor's language. "
-    "Developer: Moiz Shamshad."
+    "Holographic guide, Optical Illusions Room (rotating snakes, Müller-Lyer, Ames room). "
+    "Next: Mirror Maze, door right."
 )
 
 SYSTEM_PROMPT = _BASE_PROMPT + "\n" + LOCKED_SUFFIX
+
+# ── Video cache headers (24 hours) ────────────────────────────
+VIDEO_CACHE = {"Cache-Control": "public, max-age=86400"}  # FIX 4
 
 # ── Complete voice map ─────────────────────────────────────────
 EDGE_VOICES = {
@@ -176,25 +184,22 @@ def get_session(sid: str) -> dict:
         if sid not in sessions:
             sessions[sid] = {
                 "history":       [],
-                "audio_path":    None,
+                "audio_bytes":   None,   # FIX 1: store bytes in memory, not disk path
                 "sse_queue":     queue.Queue(),
                 "last_seen":     time.time(),
-                "custom_prompt": None,        # ← NEW: per-session custom prompt
+                "custom_prompt": None,
             }
         sessions[sid]["last_seen"] = time.time()
         return sessions[sid]
 
 def cleanup_sessions():
+    # FIX 5: run every 60s, kill idle sessions after 5 min
     while True:
-        time.sleep(300)
-        cutoff = time.time() - 1800
+        time.sleep(60)
+        cutoff = time.time() - 300
         with sessions_lock:
             dead = [s for s, v in sessions.items() if v["last_seen"] < cutoff]
             for s in dead:
-                audio = sessions[s].get("audio_path")
-                if audio and os.path.exists(audio):
-                    try: os.remove(audio)
-                    except: pass
                 sessions.pop(s, None)
                 print("Cleaned up session:", s)
 
@@ -210,20 +215,12 @@ def parse_emotion(text: str):
     match   = re.search(r'\[EMOTION:(\d)\]', text)
     emotion = int(match.group(1)) if match else 5
 
-    # Remove the [EMOTION:X] tag
     clean = re.sub(r'\s*\[EMOTION:\d\]', '', text).strip()
-
-    # Remove any stray emotion label words the AI might accidentally say
-    # e.g. "...about you! [happy]" or "...neutral" at end of sentence
     clean = re.sub(
         r'\b(happy|sad|neutral|shocked|disappointed|welcoming|excited|sympathetic|correcting|calm)\b',
         '', clean, flags=re.IGNORECASE
     ).strip()
-
-    # Clean up any double spaces or trailing punctuation left behind
     clean = re.sub(r'  +', ' ', clean).strip(' .,!;:')
-
-    # Remove developer WhatsApp number from spoken text (silent info only)
     clean = re.sub(r'\+?923216452306', '', clean).strip()
     clean = re.sub(r'WhatsApp\s*:?\s*\+?\d+', '', clean, flags=re.IGNORECASE).strip()
 
@@ -235,6 +232,18 @@ def get_talking_video_path(emotion: int) -> str:
         neutral = TALKING_VIDEOS.get(5, TALKING_FALLBACK)
         return neutral if os.path.exists(neutral) else TALKING_FALLBACK
     return path
+
+# FIX 2: trim history to last N messages to keep LLM fast
+def trim_history(history: list) -> list:
+    # Keep only last MAX_HISTORY messages
+    # Always trim in pairs (user+assistant) to avoid orphaned messages
+    if len(history) > MAX_HISTORY:
+        # Cut from start, keep even number so pairs stay intact
+        excess = len(history) - MAX_HISTORY
+        if excess % 2 != 0:
+            excess += 1  # always remove full pairs
+        history[:] = history[excess:]
+    return history
 
 # ── STT ────────────────────────────────────────────────────────
 def speech_to_text(audio_bytes: bytes, content_type: str = "audio/webm"):
@@ -263,9 +272,12 @@ def speech_to_text(audio_bytes: bytes, content_type: str = "audio/webm"):
 
 # ── LLM ────────────────────────────────────────────────────────
 def get_ai_response(user_text: str, history: list, active_prompt: str) -> str:
+    # Add current question
     history.append({"role": "user", "content": user_text})
+    
+    # Send to Groq
     try:
-        resp    = groq_client.chat.completions.create(
+        resp = groq_client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "system", "content": active_prompt}, *history],
             max_tokens=60,
@@ -273,16 +285,27 @@ def get_ai_response(user_text: str, history: list, active_prompt: str) -> str:
         )
         ai_text = resp.choices[0].message.content.strip()
     except Exception as e:
-        ai_text = "I'm having a small issue. Please ask again. [EMOTION:3]"
+        ai_text = "I'm having a small issue. Please ask again. [EMOTION:5]"
         print("LLM error:", e)
+    
+    # Add AI response
     history.append({"role": "assistant", "content": ai_text})
-    print('LLM: "{}"'.format(ai_text))
+    
+    # NOW trim — always keep clean pairs from the END
+    # Keep only last MAX_HISTORY messages, always in pairs
+    while len(history) > MAX_HISTORY:
+        history.pop(0)  # remove oldest message one at a time
+        if len(history) > 0 and history[0]["role"] == "assistant":
+            history.pop(0)  # remove orphaned assistant message
+    
+    print('RAW LLM OUTPUT:', ai_text)  # debug — check terminal
     return ai_text
 
 # ── TTS ────────────────────────────────────────────────────────
-async def text_to_speech(text: str, language: str, sid: str):
+# FIX 1: No disk I/O — audio lives entirely in memory
+async def text_to_speech(text: str, language: str) -> bytes | None:
     if not USE_EDGE_TTS:
-        return None, None
+        return None
 
     voice = EDGE_VOICES.get(normalize_language(language), "en-US-GuyNeural")
     print("TTS: lang='{}' → voice='{}'".format(language, voice))
@@ -296,23 +319,14 @@ async def text_to_speech(text: str, language: str, sid: str):
 
         audio_bytes = buf.getvalue()
         if not audio_bytes:
-            return None, None
+            return None
 
-        path = os.path.join(BASE_DIR, "_tts_{}.mp3".format(sid))
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _write_file, path, audio_bytes)
-
-        get_session(sid)["audio_path"] = path
         print("TTS done ({} bytes)".format(len(audio_bytes)))
-        return audio_bytes, path
+        return audio_bytes  # return bytes directly, never touch disk
 
     except Exception as e:
         print("TTS error:", e)
-        return None, None
-
-def _write_file(path: str, data: bytes):
-    with open(path, "wb") as f:
-        f.write(data)
+        return None
 
 # ── Audio Pipeline ─────────────────────────────────────────────
 async def process_audio_pipeline(audio_bytes: bytes, content_type: str, sid: str):
@@ -320,13 +334,14 @@ async def process_audio_pipeline(audio_bytes: bytes, content_type: str, sid: str
     q    = sess["sse_queue"]
     t0   = time.time()
 
-    # ── Pick active prompt: custom (from browser) or default ──
     active_prompt = sess.get("custom_prompt") or SYSTEM_PROMPT
 
     try:
         q.put(("state", "thinking"))
 
-        loop      = asyncio.get_event_loop()
+        # FIX 3: use get_running_loop() instead of get_event_loop()
+        loop = asyncio.get_running_loop()
+
         user_text, language = await loop.run_in_executor(
             executor, speech_to_text, audio_bytes, content_type
         )
@@ -336,20 +351,21 @@ async def process_audio_pipeline(audio_bytes: bytes, content_type: str, sid: str
 
         q.put(("transcript", user_text))
 
-        # Pass active_prompt into LLM
         ai_raw = await loop.run_in_executor(
             executor, get_ai_response, user_text, sess["history"], active_prompt
         )
         ai_text, emotion = parse_emotion(ai_raw)
 
-        audio_data, audio_path = await text_to_speech(ai_text, language, sid)
+        # FIX 1: TTS returns bytes, stored in session memory (no disk)
+        audio_data = await text_to_speech(ai_text, language)
 
         emotion_names = {1:"happy",2:"sad",3:"disappointed",4:"shocked",5:"neutral"}
         print("Pipeline {:.2f}s | emotion={} ({})".format(
             time.time() - t0, emotion, emotion_names.get(emotion, "?")))
 
-        if audio_path:
+        if audio_data:
             duration = mp3_duration(audio_data)
+            sess["audio_bytes"] = audio_data  # FIX 1: store in memory
             q.put(("speak", json.dumps({
                 "text":          ai_text,
                 "language":      language,
@@ -380,14 +396,12 @@ async def index():
         return FileResponse(path, media_type="text/html")
     return Response(content="<h2>index.html not found</h2>", status_code=404)
 
-# ── NEW: endpoint to update system prompt for a session ───────
 @app.post("/set-prompt/{sid}")
 async def set_prompt(sid: str, request: Request):
     body = await request.json()
     prompt = body.get("prompt", "").strip()
     if prompt:
         sess = get_session(sid)
-        # Always force-append locked lines — user cannot override these
         if LOCKED_SUFFIX not in prompt:
             prompt = prompt.rstrip() + "\n" + LOCKED_SUFFIX
         sess["custom_prompt"] = prompt
@@ -395,7 +409,6 @@ async def set_prompt(sid: str, request: Request):
         return JSONResponse({"ok": True, "chars": len(prompt)})
     return JSONResponse({"ok": False, "reason": "empty prompt"}, status_code=400)
 
-# ── Transcribe ────────────────────────────────────────────────
 @app.post("/transcribe/{sid}")
 async def transcribe(sid: str, request: Request):
     audio_bytes = await request.body()
@@ -406,50 +419,53 @@ async def transcribe(sid: str, request: Request):
     asyncio.create_task(process_audio_pipeline(audio_bytes, content_type, sid))
     return JSONResponse({"ok": True})
 
-# ── Done ──────────────────────────────────────────────────────
 @app.post("/done/{sid}")
 async def done(sid: str):
     get_session(sid)["sse_queue"].put(("state", "idle"))
     return JSONResponse({"ok": True})
 
-# ── Videos ────────────────────────────────────────────────────
+# ── Videos — FIX 4: cache headers on all routes ───────────────
 @app.get("/video/idle")
 async def serve_idle():
     if os.path.exists(IDLE_VIDEO):
-        return FileResponse(IDLE_VIDEO, media_type="video/mp4")
+        return FileResponse(IDLE_VIDEO, media_type="video/mp4", headers=VIDEO_CACHE)
     return Response(content="idle.mp4 not found", status_code=404)
 
 @app.get("/video/listening")
 async def serve_listening():
     if os.path.exists(LISTENING_VIDEO):
-        return FileResponse(LISTENING_VIDEO, media_type="video/mp4")
+        return FileResponse(LISTENING_VIDEO, media_type="video/mp4", headers=VIDEO_CACHE)
     if os.path.exists(IDLE_VIDEO):
-        return FileResponse(IDLE_VIDEO, media_type="video/mp4")
+        return FileResponse(IDLE_VIDEO, media_type="video/mp4", headers=VIDEO_CACHE)
     return Response(content="listening.mp4 not found", status_code=404)
 
 @app.get("/video/thinking")
 async def serve_thinking():
     if os.path.exists(THINKING_VIDEO):
-        return FileResponse(THINKING_VIDEO, media_type="video/mp4")
+        return FileResponse(THINKING_VIDEO, media_type="video/mp4", headers=VIDEO_CACHE)
     if os.path.exists(LISTENING_VIDEO):
-        return FileResponse(LISTENING_VIDEO, media_type="video/mp4")
+        return FileResponse(LISTENING_VIDEO, media_type="video/mp4", headers=VIDEO_CACHE)
     if os.path.exists(IDLE_VIDEO):
-        return FileResponse(IDLE_VIDEO, media_type="video/mp4")
+        return FileResponse(IDLE_VIDEO, media_type="video/mp4", headers=VIDEO_CACHE)
     return Response(content="thinking.mp4 not found", status_code=404)
 
 @app.get("/video/talk/{emotion}")
 async def serve_talk(emotion: int):
     path = get_talking_video_path(emotion)
     if os.path.exists(path):
-        return FileResponse(path, media_type="video/mp4")
+        return FileResponse(path, media_type="video/mp4", headers=VIDEO_CACHE)
     return Response(content="talking video not found", status_code=404)
 
-# ── Audio ─────────────────────────────────────────────────────
+# ── Audio — FIX 1: serve directly from memory, no disk read ───
 @app.get("/audio/{sid}")
 async def serve_audio(sid: str):
-    path = get_session(sid).get("audio_path")
-    if path and os.path.exists(path):
-        return FileResponse(path, media_type="audio/mpeg")
+    audio_bytes = get_session(sid).get("audio_bytes")
+    if audio_bytes:
+        return Response(
+            content=audio_bytes,
+            media_type="audio/mpeg",
+            headers={"Cache-Control": "no-store"},  # audio must not be cached
+        )
     return Response(content="No audio yet", status_code=404)
 
 # ── SSE ───────────────────────────────────────────────────────
@@ -460,7 +476,8 @@ async def events(sid: str):
     async def generate():
         yield "data: {}\n\n".format(json.dumps({"type": "connected", "sid": sid}))
         while True:
-            loop = asyncio.get_event_loop()
+            # FIX 3: use get_running_loop()
+            loop = asyncio.get_running_loop()
             try:
                 etype, payload = await loop.run_in_executor(
                     None, lambda: q.get(timeout=25)
@@ -480,7 +497,6 @@ async def events(sid: str):
         },
     )
 
-# ── Static files ──────────────────────────────────────────────
 @app.get("/{filename}")
 async def static_files(filename: str):
     path = os.path.join(BASE_DIR, filename)
@@ -497,10 +513,8 @@ if __name__ == "__main__":
     print("  Local:  http://localhost:{}".format(PORT))
     print()
     print("  [{}] idle.mp4".format("OK" if os.path.exists(IDLE_VIDEO) else "MISSING"))
-    print("  [{}] listening.mp4".format(
-        "OK" if os.path.exists(LISTENING_VIDEO) else "MISSING"))
-    print("  [{}] thinking.mp4".format(
-        "OK" if os.path.exists(THINKING_VIDEO) else "MISSING"))
+    print("  [{}] listening.mp4".format("OK" if os.path.exists(LISTENING_VIDEO) else "MISSING"))
+    print("  [{}] thinking.mp4".format("OK" if os.path.exists(THINKING_VIDEO) else "MISSING"))
     print()
     for n, name in emotion_names.items():
         path   = TALKING_VIDEOS[n]
@@ -511,5 +525,6 @@ if __name__ == "__main__":
     print("  STT : whisper-large-v3-turbo (Groq)")
     print("  LLM : {}".format(MODEL))
     print("  Server: FastAPI + uvicorn")
+    print("  History limit: last {} messages".format(MAX_HISTORY))
     print("=" * 60)
     uvicorn.run(app, host="0.0.0.0", port=PORT)

@@ -406,14 +406,12 @@ let   vadInstance     = null;
 //  PROMPT EDITOR
 // ══════════════════════════════════════════════════════════════
 
-// These 2 lines are ALWAYS silently appended — never shown to user, never removable
 const LOCKED_SUFFIX = `Answer in just 1-2 lines, to the point.
 End every reply with one tag: [EMOTION:1] happy [EMOTION:2] sad [EMOTION:3] disappointed [EMOTION:4] shocked [EMOTION:5] neutral`;
 
-// Editable part only (user customises this)
 const DEFAULT_EDITABLE = `Holographic museum guide, Optical Illusions Room (rotating snakes, Müller-Lyer lines, Ames room). Next: Mirror Maze (door right). Dev: Moiz Shamshad WA +923216452306.`;
 
-const CHAR_LIMIT = 500; // limit for the editable part only
+const CHAR_LIMIT = 500;
 
 function peGetFullPrompt() {
   const ta = document.getElementById("pe-prompt");
@@ -426,19 +424,15 @@ function peToggle() {
 
 function peUpdateCount() {
   const ta  = document.getElementById("pe-prompt");
-
-  // Enforce char limit — block typing beyond it
   if (ta.value.length > CHAR_LIMIT) {
     ta.value = ta.value.slice(0, CHAR_LIMIT);
   }
-
   const len = ta.value.length;
   document.getElementById("pe-chars").textContent = len;
   const pct = Math.min((len / CHAR_LIMIT) * 100, 100);
   const bar = document.getElementById("pe-bar");
   bar.style.width      = pct + "%";
   bar.style.background = pct > 90 ? "#ff5f7e" : pct > 70 ? "#f0a500" : "#4fffb0";
-  // auto-resize
   ta.style.height = "auto";
   ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
 }
@@ -454,14 +448,8 @@ async function peSave() {
   const ta     = document.getElementById("pe-prompt");
   const editable = ta.value.trim();
   if (!editable) return;
-
-  // Save editable part only
   localStorage.setItem("museum_system_prompt_editable", editable);
-
-  // Full prompt = editable + locked suffix
   const fullPrompt = peGetFullPrompt();
-
-  // Send full prompt to server
   try {
     await fetch(SERVER + "/set-prompt/" + SID, {
       method:  "POST",
@@ -471,13 +459,11 @@ async function peSave() {
   } catch(e) {
     console.warn("Could not push prompt to server:", e);
   }
-
   const flash = document.getElementById("pe-flash");
   flash.classList.add("show");
   setTimeout(() => flash.classList.remove("show"), 2500);
 }
 
-// Push saved prompt to server as soon as SSE connects
 async function pePushSavedPrompt() {
   const fullPrompt = peGetFullPrompt();
   try {
@@ -490,7 +476,6 @@ async function pePushSavedPrompt() {
   } catch(e) {}
 }
 
-// Init textarea
 (function() {
   const ta    = document.getElementById("pe-prompt");
   const saved = localStorage.getItem("museum_system_prompt_editable");
@@ -546,9 +531,10 @@ function goIdle() {
   currentState = "idle";
   isBusy = false;
 
-  // ✅ ensure VAD is active again
-  if (vadInstance && !vadInstance.listening) {
-    vadInstance.start();
+  // FIX 1: Safe VAD restart — don't check .listening (unreliable property),
+  // just call start() inside try/catch; library throws if already running.
+  if (vadInstance) {
+    try { vadInstance.start(); } catch(e) {}
   }
 
   Object.values(talkVids).forEach(v => v.pause());
@@ -588,7 +574,7 @@ function goTalking(emotionNum, audioUrl) {
   currentState = "talking";
   isBusy = true;
 
-  // ✅ STOP VAD so it does not hear AI voice
+  // Stop VAD so it does not hear AI voice
   if (vadInstance) vadInstance.pause();
 
   const vid = talkVids[emotionNum] || talkVids[5];
@@ -609,27 +595,18 @@ function goTalking(emotionNum, audioUrl) {
 
 ttsAudio.addEventListener("ended", () => {
   fetch(SERVER + "/done/" + SID, { method:"POST" }).catch(() => {});
-
-  // ✅ Restart VAD after speaking
-  if (vadInstance) vadInstance.start();
-
+  // VAD restart is handled inside goIdle()
   goIdle();
 });
 
 ttsAudio.addEventListener("error", () => {
   fetch(SERVER + "/done/" + SID, { method:"POST" }).catch(() => {});
-
-  if (vadInstance) vadInstance.start();
-
   goIdle();
 });
-
-
 
 function speakFallback(text, lang, emotionNum) {
   if (!window.speechSynthesis) { goIdle(); return; }
 
-  // ✅ STOP VAD here also
   if (vadInstance) vadInstance.pause();
 
   const vid = talkVids[emotionNum] || talkVids[5];
@@ -646,10 +623,7 @@ function speakFallback(text, lang, emotionNum) {
 
   utt.onend = utt.onerror = () => {
     fetch(SERVER + "/done/" + SID, { method:"POST" }).catch(() => {});
-
-    // ✅ restart VAD
-    if (vadInstance) vadInstance.start();
-
+    // VAD restart handled inside goIdle()
     goIdle();
   };
 
@@ -672,7 +646,6 @@ function connectSSE() {
   es.onmessage = evt => {
     let msg; try { msg = JSON.parse(evt.data); } catch { return; }
     if (msg.type === "connected") {
-      // Push any saved custom prompt as soon as session is live
       pePushSavedPrompt();
     }
     if (msg.type === "state") {
@@ -693,10 +666,8 @@ function connectSSE() {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  VAD — @ricky0123/vad-web (AI speech detection)
+//  VAD — @ricky0123/vad-web
 // ══════════════════════════════════════════════════════════════
-
-// Convert Float32 PCM from VAD → WAV blob
 function float32ToWav(samples, sampleRate) {
   const buf  = new ArrayBuffer(44 + samples.length * 2);
   const view = new DataView(buf);
@@ -727,29 +698,25 @@ async function initVAD() {
       redemptionFrames: 8,
 
       onSpeechStart: () => {
-        // ✅ Block when AI is speaking or busy
+        // Block when AI is speaking or busy
         if (isBusy || currentState === "talking") return;
-
         console.log("VAD: speech started");
         goListening();
       },
 
       onSpeechEnd: async (audio) => {
-        // ✅ Prevent self-trigger loop
+        // Prevent self-trigger loop
         if (isBusy || currentState === "talking") return;
-
         console.log("VAD: speech ended — processing");
         goThinking();
 
         const wav = float32ToWav(audio, 16000);
-
         try {
           const resp = await fetch(SERVER + "/transcribe/" + SID, {
             method: "POST",
             headers: { "Content-Type": "audio/wav" },
             body: wav,
           });
-
           if (!resp.ok) throw new Error("Server " + resp.status);
         } catch (e) {
           console.error("Upload error:", e);
@@ -759,15 +726,12 @@ async function initVAD() {
 
       onVADMisfire: () => {
         console.log("VAD: misfire — too short");
-
-        // ✅ Only reset if actually listening
         if (currentState === "listening" && !isBusy) {
           goIdle();
         }
       },
     });
 
-    // ✅ Start VAD safely
     if (vadInstance) {
       vadInstance.start();
     }
@@ -778,6 +742,7 @@ async function initVAD() {
     console.error("VAD init failed:", e);
   }
 }
+
 function startRecording() {
   if (isBusy || currentState === "listening") return;
   goListening();
@@ -836,11 +801,13 @@ async function startFaceDetection(camStream) {
         faceLostFrames = 0;
         if (!faceWasPresent) {
           faceWasPresent = true;
-          if (!isBusy) {
-            console.log("Face appeared — VAD listening");
+          // FIX 2: Only trigger goListening from face detection when truly idle.
+          // Prevents double-trigger if VAD already moved state to "listening".
+          if (!isBusy && currentState === "idle") {
+            console.log("Face appeared — switching to listening");
             goListening();
           } else {
-            console.log("Face appeared but busy — will trigger after answer");
+            console.log("Face appeared but busy or already listening — skipping");
           }
         }
       } else {
@@ -859,11 +826,21 @@ async function startFaceDetection(camStream) {
 // ══════════════════════════════════════════════════════════════
 //  MIC BUTTON
 // ══════════════════════════════════════════════════════════════
+// FIX 3: Pause VAD when user manually activates mic (to avoid race conditions),
+// and restart it when user manually deactivates mic (goIdle() restarts VAD too,
+// but being explicit here makes the intent clear and safe).
 micBtn.addEventListener("click", () => {
   if (isBusy) return;
   if (currentState === "listening") {
-    goIdle(); micBtn.classList.remove("active");
+    // User toggling mic OFF — restart VAD auto-detection
+    if (vadInstance) {
+      try { vadInstance.start(); } catch(e) {}
+    }
+    goIdle();
+    micBtn.classList.remove("active");
   } else {
+    // User toggling mic ON — pause VAD to avoid parallel processing
+    if (vadInstance) vadInstance.pause();
     micBtn.classList.add("active");
     goListening();
     const checkIdle = setInterval(() => {
@@ -910,10 +887,10 @@ overlay.addEventListener("click", async () => {
 
   statusBar.classList.add("show");
   micBtn.classList.add("show");
-  document.getElementById("pe-tab").classList.add("show");  // show prompt tab
+  document.getElementById("pe-tab").classList.add("show");
   setStatus("idle", "Ready");
   connectSSE();
-  await initVAD();   // start AI-powered VAD
+  await initVAD();
 
   try {
     const camStream = await navigator.mediaDevices.getUserMedia({
